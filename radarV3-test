@@ -1,0 +1,679 @@
+import sys
+import os
+import threading
+import time
+import json
+import math
+from collections import deque
+import numpy as np
+
+# Use PyQt5 for the premium dark mode settings dashboard and the transparent overlay
+from PyQt5 import QtWidgets, QtCore, QtGui
+
+try:
+    import soundcard as sc
+except ImportError:
+    print("[ERROR] 'soundcard' module is missing. Please run: pip install soundcard")
+    sys.exit(1)
+
+class Config:
+    """Handles loading, saving, and verifying advanced visualization settings."""
+    def __init__(self, filename="audio_radar_settings.json"):
+        self.filename = filename
+        self.defaults = {
+            "sensitivity": 8.0,
+            "noise_gate": 0.015,
+            "adaptive_gate": True,
+            "footstep_focus": True,
+            "dot_color": "#00f0ff",  # Cyberpunk Neon Cyan
+            "dot_size": 22,
+            "smoothing": 0.75,
+            "opacity": 0.85,
+            "overlay_y_pos": 0.15,   # 15% from the top of the screen
+            "hud_width_ratio": 0.35, # 35% of screen width (compact combat HUD)
+            "trail_length": 15,       # Number of fading history frames
+            "show_text_panned": True
+        }
+        self.settings = self.load()
+
+    def load(self):
+        if os.path.exists(self.filename):
+            try:
+                with open(self.filename, 'r') as f:
+                    data = json.load(f)
+                    # Merge default keys if missing
+                    for k, v in self.defaults.items():
+                        if k not in data:
+                            data[k] = v
+                    return data
+            except Exception as e:
+                print(f"[SYSTEM] Warning: Error loading config, reverting to defaults: {e}")
+                return self.defaults.copy()
+        return self.defaults.copy()
+
+    def save(self):
+        try:
+            with open(self.filename, 'w') as f:
+                json.dump(self.settings, f, indent=4)
+        except Exception as e:
+            print(f"[SYSTEM] Error saving settings: {e}")
+
+class SoundPulse:
+    """Represents a historic directional sound event for smooth glow trails."""
+    def __init__(self, direction, intensity, max_age):
+        self.direction = direction  # -1.0 (Left) to 1.0 (Right)
+        self.intensity = intensity  # Normalized volume
+        self.age = 0
+        self.max_age = max_age
+
+class AudioProcessor:
+    """Captures system desktop audio, applies footstep frequency filtering, and tracks active output."""
+    def __init__(self, config):
+        self.config = config
+        self.samplerate = 44100
+        self.blocksize = 1024  # Balance between latency and spectral resolution
+        
+        self.running = False
+        self.current_direction = 0.0
+        self.current_intensity = 0.0
+        self.ambient_noise_floor = 0.005  # Baseline ambient floor
+        
+        self.device = None
+        self.on_device_auto_changed_callback = None
+        self._find_wasapi_loopback()
+
+    def _find_wasapi_loopback(self):
+        """Finds the current active system playback device's loopback recorder dynamically."""
+        try:
+            # 1. Grab the currently active default speaker on Windows
+            default_speaker = sc.default_speaker()
+            print(f"[SYSTEM] Detected Windows Active Playback Device: {default_speaker.name}")
+            
+            # 2. Search for the corresponding loopback microphone matching the name
+            mics = sc.all_microphones(include_loopback=True)
+            for m in mics:
+                if getattr(m, 'isloopback', False) and (default_speaker.name in m.name or m.name in default_speaker.name):
+                    self.device = m
+                    print(f"[SYSTEM] Automatically bound loopback recorder to: {self.device.name}")
+                    return
+
+            # Fallback 1: Try targeting loopback via direct matching query
+            try:
+                self.device = sc.get_microphone(id=default_speaker.name, include_loopback=True)
+                print(f"[SYSTEM] Fallback 1 matched loopback: {self.device.name}")
+                return
+            except Exception:
+                pass
+
+            # Fallback 2: Pick the first available loopback recorder
+            for m in mics:
+                if getattr(m, 'isloopback', False):
+                    self.device = m
+                    print(f"[SYSTEM] Fallback 2 selected first loopback: {self.device.name}")
+                    return
+
+            # Fallback 3: Use the default standard microphone
+            self.device = sc.default_microphone()
+            print(f"[SYSTEM] Fallback 3 (Loopback unavailable, capturing Mic): {self.device.name}")
+        except Exception as e:
+            print(f"[ERROR] Failed to find active playback loopback device: {e}")
+            self.device = None
+
+    def start(self):
+        if self.running or self.device is None:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if hasattr(self, 'thread') and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+
+    def change_device(self, new_device):
+        """Changes the audio device dynamically and restarts the thread stream."""
+        print(f"[SYSTEM] Changing capture target to: {new_device.name}")
+        self.stop()
+        self.device = new_device
+        self.start()
+
+    def _capture_loop(self):
+        """Continuously reads audio, tracks device shifts, filters footsteps, and extracts direction."""
+        while self.running:
+            try:
+                # Hotplug auto-detection: If the Windows default playback speaker shifts, auto-migrate our stream
+                try:
+                    current_system_default = sc.default_speaker()
+                    if self.device and getattr(self.device, 'isloopback', False):
+                        if current_system_default.name not in self.device.name and self.device.name not in current_system_default.name:
+                            print(f"[SYSTEM] Windows Playback Device Change Detected! Auto-migrating from '{self.device.name}' to '{current_system_default.name}'")
+                            self._find_wasapi_loopback()
+                            if self.on_device_auto_changed_callback and self.device:
+                                self.on_device_auto_changed_callback(self.device)
+                except Exception:
+                    pass
+
+                if self.device is None:
+                    time.sleep(0.5)
+                    continue
+                
+                # Open system loopback recorder
+                with self.device.recorder(samplerate=self.samplerate, blocksize=self.blocksize) as recorder:
+                    while self.running:
+                        # Double-check default speaker changes inside the loop to break out and rebuild if needed
+                        try:
+                            current_system_default = sc.default_speaker()
+                            if self.device and getattr(self.device, 'isloopback', False):
+                                if current_system_default.name not in self.device.name and self.device.name not in current_system_default.name:
+                                    break  # Breaks inner context loop to trigger reconstruction in outer loop
+                        except Exception:
+                            pass
+
+                        # Pull audio frames
+                        data = recorder.record(numframes=self.blocksize)
+                        if len(data) == 0:
+                            continue
+                        
+                        # Split channels
+                        if data.shape[1] >= 2:
+                            left = data[:, 0]
+                            right = data[:, 1]
+                        else:
+                            left = data[:, 0]
+                            right = data[:, 0] # mono fullback
+
+                        # Live Fourier Transform (FFT) analysis to filter specific sound frequencies
+                        fft_left = np.fft.rfft(left)
+                        fft_right = np.fft.rfft(right)
+                        freqs = np.fft.rfftfreq(len(left), d=1.0/self.samplerate)
+                        
+                        # Apply advanced bi-band equalizer filter
+                        if self.config.settings["footstep_focus"]:
+                            # Isolate bass thuds (70-220Hz) and gravel/crunch noises (950Hz-3.5kHz)
+                            weights = np.ones_like(freqs)
+                            weights[freqs < 70] = 0.05
+                            weights[(freqs >= 70) & (freqs <= 220)] = 2.2 
+                            weights[(freqs > 220) & (freqs < 950)] = 0.4  
+                            weights[(freqs >= 950) & (freqs <= 3500)] = 2.5 
+                            weights[freqs > 3500] = 0.1 
+                            
+                            weighted_left = fft_left * weights
+                            weighted_right = fft_right * weights
+                        else:
+                            weighted_left = fft_left
+                            weighted_right = fft_right
+
+                        # Extract Root Mean Square (RMS) energy
+                        left_rms = np.sqrt(np.mean(np.abs(weighted_left)**2))
+                        right_rms = np.sqrt(np.mean(np.abs(weighted_right)**2))
+                        total_energy = left_rms + right_rms
+                        
+                        # Dynamic Ambient Gate tracking
+                        if self.config.settings["adaptive_gate"]:
+                            if total_energy < self.ambient_noise_floor * 1.5:
+                                self.ambient_noise_floor = (0.995 * self.ambient_noise_floor) + (0.005 * total_energy)
+                            
+                            gate_threshold = self.config.settings["noise_gate"] + (self.ambient_noise_floor * 1.3)
+                        else:
+                            gate_threshold = self.config.settings["noise_gate"]
+
+                        # Apply gate filter and compute stereo tracking vector
+                        if total_energy < gate_threshold:
+                            target_intensity = 0.0
+                            target_direction = 0.0
+                        else:
+                            target_intensity = min(1.0, total_energy * self.config.settings["sensitivity"])
+                            target_direction = (right_rms - left_rms) / (total_energy + 1e-6)
+                            
+                            # Accentuate directional extremes
+                            target_direction = np.sign(target_direction) * (abs(target_direction) ** 0.8)
+                            target_direction = max(-1.0, min(1.0, target_direction))
+
+                        # Smooth interpolation
+                        smoothing = self.config.settings["smoothing"]
+                        self.current_direction = (self.current_direction * smoothing) + (target_direction * (1.0 - smoothing))
+                        self.current_intensity = (self.current_intensity * smoothing) + (target_intensity * (1.0 - smoothing))
+
+            except Exception as e:
+                # Yield context if device gets disconnected or blocked
+                time.sleep(0.5)
+
+class SettingsWindow(QtWidgets.QMainWindow):
+    """The Cyberpunk-Styled configuration GUI for modifying visualization attributes in real-time."""
+    def __init__(self, config, audio_processor, overlay_window):
+        super().__init__()
+        self.config = config
+        self.audio_processor = audio_processor
+        self.overlay_window = overlay_window
+        self.audio_devices = []
+        
+        # Connect audio processor auto-switch event to update GUI choices
+        self.audio_processor.on_device_auto_changed_callback = self.handle_auto_device_switch
+        
+        self.setWindowTitle("Tactical Radar Dashboard")
+        self.resize(440, 680)
+        self.setStyleSheet(self.get_stylesheet())
+        
+        self.init_ui()
+
+    def get_stylesheet(self):
+        return """
+            QMainWindow {
+                background-color: #0b0b0d;
+            }
+            QWidget {
+                color: #e2e8f0;
+                font-family: 'Segoe UI', Arial, sans-serif;
+            }
+            QLabel {
+                font-size: 12px;
+                color: #94a3b8;
+            }
+            QGroupBox {
+                border: 1px solid #1e293b;
+                border-radius: 8px;
+                margin-top: 15px;
+                font-weight: bold;
+                font-size: 13px;
+                color: #00f0ff;
+                padding-top: 12px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 6px;
+            }
+            QSlider::groove:horizontal {
+                border: 1px solid #1e293b;
+                height: 6px;
+                background: #1e293b;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #00f0ff;
+                border: 1px solid #38bdf8;
+                width: 14px;
+                height: 14px;
+                margin-top: -4px;
+                margin-bottom: -4px;
+                border-radius: 7px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #38bdf8;
+            }
+            QCheckBox {
+                spacing: 8px;
+                font-size: 13px;
+                color: #e2e8f0;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border: 1px solid #1e293b;
+                border-radius: 4px;
+                background: #1e293b;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #00f0ff;
+                border: 1px solid #38bdf8;
+            }
+            QComboBox {
+                background-color: #0f172a;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+                padding: 6px;
+                color: #e2e8f0;
+                min-width: 150px;
+            }
+            QComboBox::drop-down {
+                border: 0;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #0b0b0d;
+                border: 1px solid #1e293b;
+                selection-background-color: #00f0ff;
+                selection-color: #0b0b0d;
+            }
+            QPushButton {
+                background-color: #0f172a;
+                border: 1px solid #00f0ff;
+                color: #00f0ff;
+                padding: 10px;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #00f0ff;
+                color: #0b0b0d;
+            }
+        """
+
+    def init_ui(self):
+        central_widget = QtWidgets.QWidget()
+        self.setCentralWidget(central_widget)
+        layout = QtWidgets.QVBoxLayout(central_widget)
+        layout.setSpacing(12)
+        
+        # Header HUD Title
+        title_label = QtWidgets.QLabel("TACTICAL AUDIO RADAR")
+        title_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #00f0ff; letter-spacing: 2px; margin-bottom: 5px;")
+        title_label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(title_label)
+        
+        # --- GROUP 1: AUDIO ROUTING CONTROLLER ---
+        audio_group = QtWidgets.QGroupBox("Audio Device Routing")
+        audio_layout = QtWidgets.QVBoxLayout(audio_group)
+        
+        info_lbl = QtWidgets.QLabel("Automatically routes to Windows Default. Override manually below:")
+        info_lbl.setStyleSheet("font-size: 11px; color: #64748b; margin-bottom: 4px;")
+        audio_layout.addWidget(info_lbl)
+        
+        self.device_combo = QtWidgets.QComboBox()
+        self.device_combo.currentIndexChanged.connect(self.on_device_changed)
+        audio_layout.addWidget(self.device_combo)
+        
+        # Populate Audio Input Devices
+        self.refresh_devices()
+        
+        layout.addWidget(audio_group)
+        
+        # --- GROUP 2: DSP FOOTSTEP FILTERING ---
+        dsp_group = QtWidgets.QGroupBox("Tactical Signal Filters")
+        dsp_layout = QtWidgets.QVBoxLayout(dsp_group)
+        
+        self.footstep_cb = QtWidgets.QCheckBox("Isolate Footsteps (Bi-Band FFT)")
+        self.footstep_cb.setChecked(self.config.settings["footstep_focus"])
+        self.footstep_cb.stateChanged.connect(self.update_footstep_focus)
+        dsp_layout.addWidget(self.footstep_cb)
+        
+        self.adaptive_cb = QtWidgets.QCheckBox("Adaptive Ambient Gate (No False Triggers)")
+        self.adaptive_cb.setChecked(self.config.settings["adaptive_gate"])
+        self.adaptive_cb.stateChanged.connect(self.update_adaptive_gate)
+        dsp_layout.addWidget(self.adaptive_cb)
+        
+        layout.addWidget(dsp_group)
+        
+        # --- GROUP 3: CALIBRATION SLIDERS ---
+        cal_group = QtWidgets.QGroupBox("HUD Calibration")
+        cal_layout = QtWidgets.QGridLayout(cal_group)
+        cal_layout.setSpacing(10)
+        
+        row = 0
+        def add_control(label_text, key, min_val, max_val, scale, precision):
+            nonlocal row
+            lbl = QtWidgets.QLabel(label_text)
+            slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            slider.setRange(int(min_val * scale), int(max_val * scale))
+            slider.setValue(int(self.config.settings[key] * scale))
+            
+            val_lbl = QtWidgets.QLabel(f"{self.config.settings[key]:.{precision}f}")
+            val_lbl.setStyleSheet("color: #00f0ff; font-weight: bold;")
+            
+            def slider_changed(v):
+                real_val = v / scale
+                val_lbl.setText(f"{real_val:.{precision}f}")
+                self.config.settings[key] = real_val
+                self.config.save()
+                
+            slider.valueChanged.connect(slider_changed)
+            
+            cal_layout.addWidget(lbl, row, 0)
+            cal_layout.addWidget(slider, row, 1)
+            cal_layout.addWidget(val_lbl, row, 2)
+            row += 1
+
+        add_control("Sensing Gain:", "sensitivity", 1.0, 30.0, 10.0, 1)
+        add_control("Static Noise Gate:", "noise_gate", 0.001, 0.1, 1000.0, 3)
+        add_control("Smoothing (Interpolation):", "smoothing", 0.0, 0.95, 100.0, 2)
+        add_control("Base Indicator Size:", "dot_size", 8, 80, 1.0, 0)
+        add_control("Maximum HUD Opacity:", "opacity", 0.1, 1.0, 100.0, 2)
+        add_control("HUD Vert Position:", "overlay_y_pos", 0.02, 0.98, 100.0, 2)
+        add_control("Radar HUD Width:", "hud_width_ratio", 0.1, 0.9, 100.0, 2)
+        add_control("Glow Trail Length:", "trail_length", 1, 50, 1.0, 0)
+        
+        layout.addWidget(cal_group)
+        
+        # --- BUTTONS & FOOTER ---
+        self.panned_text_cb = QtWidgets.QCheckBox("Display LEFT/RIGHT Text warnings")
+        self.panned_text_cb.setChecked(self.config.settings["show_text_panned"])
+        self.panned_text_cb.stateChanged.connect(self.update_panned_text)
+        layout.addWidget(self.panned_text_cb)
+        
+        color_btn = QtWidgets.QPushButton("Choose Neon HUD Color")
+        color_btn.clicked.connect(self.choose_color)
+        layout.addWidget(color_btn)
+        
+        # Display current device name
+        self.dev_label = QtWidgets.QLabel("Source: Loading...")
+        self.dev_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.dev_label.setStyleSheet("font-size: 11px; color: #38bdf8; margin-top: 5px;")
+        layout.addWidget(self.dev_label)
+        
+        if self.audio_processor.device:
+            self.dev_label.setText(f"Source: {self.audio_processor.device.name}")
+
+    def refresh_devices(self):
+        """Discovers sound devices and registers them into the selection GUI."""
+        self.device_combo.blockSignals(True)
+        self.device_combo.clear()
+        self.audio_devices = []
+        
+        try:
+            mics = sc.all_microphones(include_loopback=True)
+            for m in mics:
+                self.audio_devices.append(m)
+                is_loop = getattr(m, 'isloopback', False)
+                prefix = "[SYSTEM LOOPBACK] " if is_loop else "[MIC] "
+                self.device_combo.addItem(f"{prefix}{m.name}")
+        except Exception as e:
+            print(f"[SYSTEM] Could not resolve audio device list: {e}")
+
+        # Highlight currently active hardware device in menu selection
+        active_index = 0
+        if self.audio_processor.device:
+            for idx, dev in enumerate(self.audio_devices):
+                if dev.name == self.audio_processor.device.name and getattr(dev, 'isloopback', False) == getattr(self.audio_processor.device, 'isloopback', False):
+                    active_index = idx
+                    break
+        
+        self.device_combo.setCurrentIndex(active_index)
+        self.device_combo.blockSignals(False)
+
+    def on_device_changed(self, index):
+        """Triggers manual routing changes when user manually changes selections."""
+        if 0 <= index < len(self.audio_devices):
+            selected_device = self.audio_devices[index]
+            self.audio_processor.change_device(selected_device)
+            self.dev_label.setText(f"Source: {selected_device.name}")
+
+    def handle_auto_device_switch(self, new_device):
+        """Syncs GUI combobox states when the core processor switches due to Windows hardware hotplugging."""
+        self.device_combo.blockSignals(True)
+        
+        # Re-populate choices in case devices were added/removed
+        self.refresh_devices()
+        
+        for idx, dev in enumerate(self.audio_devices):
+            if dev.name == new_device.name and getattr(dev, 'isloopback', False) == getattr(new_device, 'isloopback', False):
+                self.device_combo.setCurrentIndex(idx)
+                break
+                
+        self.dev_label.setText(f"Source: {new_device.name}")
+        self.device_combo.blockSignals(False)
+
+    def update_footstep_focus(self, state):
+        self.config.settings["footstep_focus"] = bool(state)
+        self.config.save()
+
+    def update_adaptive_gate(self, state):
+        self.config.settings["adaptive_gate"] = bool(state)
+        self.config.save()
+
+    def update_panned_text(self, state):
+        self.config.settings["show_text_panned"] = bool(state)
+        self.config.save()
+
+    def choose_color(self):
+        current_color = QtGui.QColor(self.config.settings["dot_color"])
+        color = QtWidgets.QColorDialog.getColor(current_color, self, "Select HUD Indicator Color")
+        if color.isValid():
+            hex_color = color.name()
+            self.config.settings["dot_color"] = hex_color
+            self.config.save()
+
+    def closeEvent(self, event):
+        # Graceful app shutdown
+        self.audio_processor.stop()
+        self.overlay_window.close()
+        QtWidgets.QApplication.quit()
+
+class OverlayWindow(QtWidgets.QWidget):
+    """Transparent click-through desktop overlay displaying reactive, glowing sound direction arrows."""
+    def __init__(self, audio_processor, config):
+        super().__init__()
+        self.audio_processor = audio_processor
+        self.config = config
+        self.pulses = deque()  # Store historical sound pulses for trails
+        
+        self.init_overlay()
+        
+        # High refresh render loop tick timer
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(8)  # Target ~120Hz refresh limits
+
+    def init_overlay(self):
+        # Transparent, click-through, always-on-top desktop overlay configurations
+        flags = QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.Tool | QtCore.Qt.WindowTransparentForInput
+        self.setWindowFlags(flags)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        
+        # Span across main monitor layout boundaries
+        screen = QtWidgets.QApplication.primaryScreen().geometry()
+        self.setGeometry(screen)
+        self.show()
+
+    def tick(self):
+        # Age out old pulse events for trail fade-out
+        for p in list(self.pulses):
+            p.age += 1
+            if p.age > self.config.settings["trail_length"]:
+                self.pulses.popleft()
+                
+        # Inject current sound tracking vector frame
+        intensity = self.audio_processor.current_intensity
+        if intensity > 0.01:
+            self.pulses.append(SoundPulse(
+                direction=self.audio_processor.current_direction,
+                intensity=intensity,
+                max_age=int(self.config.settings["trail_length"])
+            ))
+            
+        self.update()  # Force canvas update events
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        
+        settings = self.config.settings
+        width = self.width()
+        height = self.height()
+        
+        # Determine geometric HUD layout positions
+        hud_center_x = width / 2
+        hud_y = height * settings["overlay_y_pos"]
+        hud_active_width = width * settings["hud_width_ratio"]
+        
+        # Draw a sleek, faint horizontal layout guide line
+        subtle_pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 12))
+        subtle_pen.setWidth(2)
+        painter.setPen(subtle_pen)
+        painter.drawLine(
+            int(hud_center_x - hud_active_width / 2), int(hud_y), 
+            int(hud_center_x + hud_active_width / 2), int(hud_y)
+        )
+        
+        # Draw glowing static coordinate target center reference point
+        painter.setBrush(QtGui.QBrush(QtGui.QColor(0, 240, 255, 30)))
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.drawEllipse(QtCore.QPointF(hud_center_x, hud_y), 4.0, 4.0)
+        
+        base_color = QtGui.QColor(settings["dot_color"])
+        
+        # Draw historical glowing vectors backwards from decay array
+        for pulse in self.pulses:
+            age_factor = 1.0 - (pulse.age / pulse.max_age)
+            alpha = int(255 * age_factor * pulse.intensity * settings["opacity"])
+            alpha = max(0, min(255, alpha))
+            
+            pulse_color = QtGui.QColor(base_color)
+            pulse_color.setAlpha(alpha)
+            
+            # Translate panning vectors onto pixel screen dimensions
+            x_pos = hud_center_x + (pulse.direction * (hud_active_width / 2))
+            
+            # Paint glow ring
+            painter.setBrush(QtCore.Qt.NoBrush)
+            glow_pen = QtGui.QPen(pulse_color)
+            glow_pen.setWidth(2)
+            painter.setPen(glow_pen)
+            
+            current_dot_size = settings["dot_size"] * (0.4 + 0.6 * age_factor) * (0.8 + 0.5 * pulse.intensity)
+            painter.drawEllipse(QtCore.QPointF(x_pos, hud_y), current_dot_size, current_dot_size)
+            
+            # Paint solid inner core indicator
+            solid_color = QtGui.QColor(pulse_color)
+            solid_color.setAlpha(int(alpha * 0.7))
+            painter.setBrush(QtGui.QBrush(solid_color))
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.drawEllipse(QtCore.QPointF(x_pos, hud_y), current_dot_size * 0.4, current_dot_size * 0.4)
+            
+        # Draw dynamic text alerts for heavy left/right sound panning
+        if settings["show_text_panned"] and len(self.pulses) > 0:
+            last_pulse = self.pulses[-1]
+            if last_pulse.intensity > 0.15 and abs(last_pulse.direction) > 0.5:
+                direction_str = "LEFT" if last_pulse.direction < 0 else "RIGHT"
+                
+                text_color = QtGui.QColor(base_color)
+                text_color.setAlpha(int(255 * last_pulse.intensity * settings["opacity"]))
+                
+                painter.setPen(QtGui.QPen(text_color))
+                font = painter.font()
+                font.setPointSize(12)
+                font.setBold(True)
+                font.setLetterSpacing(QtGui.QFont.PercentageSpacing, 110)
+                painter.setFont(font)
+                
+                # Center text layout bounds underneath respective target points
+                text_x_pos = hud_center_x + (last_pulse.direction * (hud_active_width / 2)) - 50
+                rect = QtCore.QRectF(text_x_pos, hud_y + settings["dot_size"] + 8, 100, 25)
+                painter.drawText(rect, QtCore.Qt.AlignCenter, f"<< {direction_str} >>")
+
+def run_app():
+    # Force platform settings for proper screen scale support
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+    
+    app = QtWidgets.QApplication(sys.argv)
+    
+    print("[SYSTEM] High-Refresh-Rate Optimized Trail Radar Initialized.")
+    config = Config()
+    
+    # Run the background processor
+    audio_processor = AudioProcessor(config)
+    audio_processor.start()
+    
+    # Instantiate the transparent overlay screen
+    overlay = OverlayWindow(audio_processor, config)
+    
+    # Instantiate calibration controller dashboard
+    settings_gui = SettingsWindow(config, audio_processor, overlay)
+    settings_gui.show()
+    
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    run_app()
