@@ -21,11 +21,12 @@ class AudioRadarApp:
         self.audio_thread = None
         
         # --- TRACKING POOL ---
-        # Format: [current_x, current_y, target_x, target_y, active_frames, base_color_name, relative_vol, history_list, current_opacity, current_size]
+        # Format: [current_x, current_y, target_x, target_y, active_frames, base_color_name, relative_vol, history_list, current_opacity, current_size, footstep_factor]
         self.max_slots = 10
         self.tracking_slots = {}
         for i in range(self.max_slots):
-            self.tracking_slots[i] = [0.5, 0.5, 0.5, 0.5, 0, "center", 0.0, [], 0.0, 3.0]
+            # Index 10: Footstep alert scale modifier (0.0 to 1.0)
+            self.tracking_slots[i] = [0.5, 0.5, 0.5, 0.5, 0, "center", 0.0, [], 0.0, 3.0, 0.0]
 
         self.text_current_x = 0.5
         self.text_target_x = 0.5
@@ -37,6 +38,10 @@ class AudioRadarApp:
         self.smooth_live_rms = 0.0     
         self.rolling_peak_rms = 0.010  
         self.current_samplerate = 44100 
+        
+        # Historical buffer to track energy spikes (for footstep/transient detection)
+        self.energy_history = []
+        self.max_energy_history_len = 12
         
         self.last_click_time = 0
         self.click_streak = 0
@@ -98,8 +103,8 @@ class AudioRadarApp:
         self.screen_width = self.root.winfo_screenwidth()
         self.screen_height = self.root.winfo_screenheight()
         
-        self.BASE_RADIUS = 3
-        self.MAX_BONUS_RADIUS = 7  
+        self.BASE_RADIUS = 3.5
+        self.MAX_BONUS_RADIUS = 9.0  
         
         # Pre-create Canvas elements including motion trail indicators
         self.dot_ui_items = {}
@@ -219,7 +224,8 @@ class AudioRadarApp:
         fft_r = np.fft.rfft(right)
         freqs = np.fft.rfftfreq(len(left), d=1/self.current_samplerate)
         
-        kill_indices = np.where((freqs < 60) | (freqs > 700))[0]
+        # We target structural spectrum of 45-750Hz to identify directional cues
+        kill_indices = np.where((freqs < 45) | (freqs > 750))[0]
         fft_l[kill_indices] = 0
         fft_r[kill_indices] = 0
         
@@ -235,6 +241,25 @@ class AudioRadarApp:
             self.text_active = False
             return
 
+        # --- TRANSIENT & FOOTSTEP RECOGNITION HEURISTIC ---
+        # Footsteps are short, sudden high-energy changes primarily contained between 60Hz and 300Hz.
+        footstep_band_indices = np.where((freqs >= 60) & (freqs <= 320))[0]
+        band_energy = np.sum(np.abs(fft_l[footstep_band_indices]) + np.abs(fft_r[footstep_band_indices]))
+        
+        self.energy_history.append(band_energy)
+        if len(self.energy_history) > self.max_energy_history_len:
+            self.energy_history.pop(0)
+            
+        is_footstep_like = False
+        if len(self.energy_history) >= 4:
+            # Look for a sudden sharp increase compared to immediate average history (onset transient)
+            prev_avg_energy = np.mean(self.energy_history[:-2]) if len(self.energy_history) > 2 else 1e-5
+            current_energy = self.energy_history[-1]
+            
+            # If current local slice energy spikes significantly (> 2.3x) compared to recent background envelope
+            if current_energy > (prev_avg_energy * 2.3) and current_energy > 0.005:
+                is_footstep_like = True
+
         # 1. --- LOGARITHMIC SPREAD MATRIX ---
         correlation = np.correlate(left_clean - np.mean(left_clean), right_clean - np.mean(right_clean), mode='full')
         delay_sample = np.argmax(correlation) - (len(left_clean) - 1)
@@ -244,8 +269,8 @@ class AudioRadarApp:
         base_x = ((clamped_delay / max_delay) + 1.0) / 2.0 
         centered_x = base_x - 0.5
         if centered_x != 0:
-            expanded_x = math.copysign(math.pow(abs(centered_x) * 2.0, 0.70) * 0.5, centered_x)
-            target_x = max(0.02, min(0.98, (expanded_x * 1.5) + 0.5))
+            expanded_x = math.copysign(math.pow(abs(centered_x) * 2.0, 0.65) * 0.5, centered_x)
+            target_x = max(0.02, min(0.98, (expanded_x * 1.55) + 0.5))
         else:
             target_x = 0.5
 
@@ -253,7 +278,6 @@ class AudioRadarApp:
             return
 
         # 2. --- Vertically Compressed Y-Axis Plane ---
-        # Instead of cloning 4 dots per sound, only track the absolute loudest dominant frequency
         fft_combined = np.abs(fft_l + fft_r)
         
         raw_detected_points = []
@@ -264,7 +288,7 @@ class AudioRadarApp:
             base_y = 1.0 - (math.log10(freq) / 3.8)
             target_y = 0.45 + (max(0.1, min(0.9, base_y)) - 0.5) * 0.25
             
-            # Map how loud the sound is ABOVE the noise floor (true Signal-to-Noise Ratio)
+            # Map signal-to-noise ratio relative volume
             signal_strength = min(1.0, (total_rms - self.noise_floor) / 0.015)
             raw_detected_points.append((target_x, target_y, signal_strength))
 
@@ -302,9 +326,16 @@ class AudioRadarApp:
                 self.tracking_slots[assigned_slot][4] = 16 
                 self.tracking_slots[assigned_slot][6] = r_vol 
                 
-                if tx < 0.42: self.tracking_slots[assigned_slot][5] = "left"
-                elif tx > 0.58: self.tracking_slots[assigned_slot][5] = "right"
-                else: self.tracking_slots[assigned_slot][5] = "center"
+                # Update footstep warning transient factor
+                if is_footstep_like:
+                    self.tracking_slots[assigned_slot][10] = 1.0
+                
+                if tx < 0.42: 
+                    self.tracking_slots[assigned_slot][5] = "left"
+                elif tx > 0.58: 
+                    self.tracking_slots[assigned_slot][5] = "right"
+                else: 
+                    self.tracking_slots[assigned_slot][5] = "center"
 
         # 5. --- ISOLATED REAR TEXT CONTEXT ---
         is_real_rear_sound = False
@@ -327,21 +358,20 @@ class AudioRadarApp:
             self.text_active = False
 
     def animate_loop(self):
-        # Calculate precise delta time (dt) in seconds relative to actual screen tick rate
         now = time.perf_counter()
         dt = now - self.last_frame_time
         self.last_frame_time = now
         
-        # Clamp delta time to avoid huge frame jumps on system hitches
         dt = min(0.1, dt)
 
         # --- TRUE EXPONENTIAL SMOOTHING COEFFICIENTS ---
-        move_coef = 1.0 - math.exp(-15.0 * dt)    # Smooth tracking glide
-        opacity_coef = 1.0 - math.exp(-9.0 * dt)  # Smooth fade-in/out
-        size_coef = 1.0 - math.exp(-12.0 * dt)    # Smooth volume breathing
-        bar_coef = 1.0 - math.exp(-15.0 * dt)     # Smooth control visualizer meter
+        move_coef = 1.0 - math.exp(-15.0 * dt)    
+        opacity_coef = 1.0 - math.exp(-9.0 * dt)  
+        size_coef = 1.0 - math.exp(-12.0 * dt)    
+        bar_coef = 1.0 - math.exp(-15.0 * dt)     
+        decay_coef = 1.0 - math.exp(-5.0 * dt)    # Decays footstep flare back to normal smoothly
 
-        # Update Dashboard Visuals Focus (Dampened & frame-rate independent)
+        # Update Dashboard Visuals Focus
         self.smooth_live_rms += (self.current_live_rms - self.smooth_live_rms) * bar_coef
         val_percentage = min(1.0, self.smooth_live_rms / (self.rolling_peak_rms + 1e-6))
         cutoff_percentage = min(1.0, self.noise_floor / (self.rolling_peak_rms + 1e-6))
@@ -365,48 +395,56 @@ class AudioRadarApp:
             for i in range(self.max_slots):
                 coords = self.tracking_slots[i]
                 
-                # Dynamic targets based on activity state
                 if coords[4] > 0:
-                    coords[4] -= 16.0 * dt  # Decrement frames dynamically matching time elapsed
+                    coords[4] -= 16.0 * dt  
                     target_opacity_factor = 1.0
                 else:
                     target_opacity_factor = 0.0
 
-                # --- SMOOTH OPACITY TRANSITIONS ---
-                # Adjusted for high-refresh rate Independence
+                # Decelerate footstep highlight over time
+                coords[10] -= (coords[10] * decay_coef)
+
                 coords[8] += (target_opacity_factor - coords[8]) * opacity_coef
 
-                # Render only if the dot is somewhat visible
                 if coords[8] > 0.01:
                     prev_pix_x = int(self.screen_width * coords[0])
                     prev_pix_y = int(self.screen_height * coords[1])
                     
-                    # Update interpolations (dt-compensated LERP coefficients)
                     coords[0] += (coords[2] - coords[0]) * move_coef
                     coords[1] += (coords[3] - coords[1]) * move_coef
                     
                     pix_x = int(self.screen_width * coords[0])
                     pix_y = int(self.screen_height * coords[1])
                     
-                    # Distance checks for cursor deadzone
-                    if math.sqrt((pix_x - mouse_x)**2 + (pix_y - mouse_y)**2) < 12:
-                        coords[8] = 0.0  # Force fade out instantly if on cursor
+                    if math.sqrt((pix_x - mouse_x)**2 + (pix_y - mouse_y)**2) < 15:
+                        coords[8] = 0.0  
                         self.canvas.coords(self.dot_ui_items[i]['halo'], -100, -100, -100, -100)
                         self.canvas.coords(self.dot_ui_items[i]['core'], -100, -100, -100, -100)
                         self.canvas.coords(self.dot_ui_items[i]['trail1'], -100, -100, -100, -100)
                         self.canvas.coords(self.dot_ui_items[i]['trail2'], -100, -100, -100, -100)
-                        coords[7] = []  # Clear history
+                        coords[7] = []  
                         continue
 
-                    # --- SMOOTH SIZE TRANSITIONS ---
-                    # Calculate target radius based on immediate volume and LERP the current radius
-                    target_radius = self.BASE_RADIUS + (coords[6] * self.MAX_BONUS_RADIUS)
+                    # --- SIDE DYNAMICS & FOOTSTEP MODIFIERS ---
+                    # 1. Edge-scaling factor: Expand targets on the far left or far right
+                    dist_from_center = abs(coords[0] - 0.5) # Range: 0.0 to 0.5
+                    edge_growth_factor = 1.0 + (dist_from_center * 1.6) # Increases size by up to 80% on the edges
+                    
+                    # 2. Footstep transient burst multiplier
+                    footstep_multiplier = 1.0 + (coords[10] * 1.8) # Grow by up to 180% for footsteps/transients
+                    
+                    # Compute dynamic final target radius
+                    dynamic_base = self.BASE_RADIUS + (coords[6] * self.MAX_BONUS_RADIUS)
+                    target_radius = dynamic_base * edge_growth_factor * footstep_multiplier
+                    
                     coords[9] += (target_radius - coords[9]) * size_coef  
                     
                     core_radius = int(coords[9])
-                    halo_radius = core_radius + 4
                     
-                    # Base RGB mapping for precise transparency calculation
+                    # Footsteps get a massive flaring halo ring
+                    halo_scale = 1.4 if coords[10] < 0.1 else 1.4 + (coords[10] * 1.5)
+                    halo_radius = int(core_radius * halo_scale) + 4
+                    
                     if coords[5] == "left":
                         base_r, base_g, base_b = 255, 68, 68
                     elif coords[5] == "right":
@@ -414,33 +452,39 @@ class AudioRadarApp:
                     else:
                         base_r, base_g, base_b = 68, 255, 68
 
-                    # Transparency blending relative to widescreen placement, LERP-smoothed visibility,
-                    # AND the immediate audio volume strength (relative_vol) to completely dim idle noise spots.
-                    dist_from_center = abs(coords[0] - 0.5)
-                    spatial_opacity = 0.05 + (dist_from_center / 0.5) * 0.85
+                    # Adjust transparency scale
+                    spatial_opacity = 0.15 + (dist_from_center / 0.5) * 0.75
+                    volume_opacity_scale = math.pow(coords[6], 1.3)
                     
-                    # We multiply by (coords[6] ** 1.5) to exponentially crush quiet background noise dots
-                    # while allowing loud, clear, intentional footprints to light up fully.
-                    volume_opacity_scale = math.pow(coords[6], 1.5)
-                    opacity_factor = max(0.01, min(0.9, spatial_opacity)) * coords[8] * volume_opacity_scale
+                    # Footsteps force high visual priority (bypass complete volume-dimming drop)
+                    opacity_factor = max(0.01, min(0.95, spatial_opacity)) * coords[8] * max(volume_opacity_scale, coords[10] * 0.85)
 
                     if opacity_factor > 0.01:
-                        # Blend core and trail color variations
                         faded_r = int(base_r * opacity_factor)
                         faded_g = int(base_g * opacity_factor)
                         faded_b = int(base_b * opacity_factor)
                         core_color = f"#{faded_r:02x}{faded_g:02x}{faded_b:02x}"
 
-                        # Update history to build lagging trail coordinates
+                        # If flagged as a transient footstep, flash white/bright cyan Core
+                        if coords[10] > 0.2:
+                            flash_t = min(1.0, coords[10])
+                            mix_r = int(base_r * (1.0 - flash_t) + 255 * flash_t)
+                            mix_g = int(base_g * (1.0 - flash_t) + 255 * flash_t)
+                            mix_b = int(base_b * (1.0 - flash_t) + 255 * flash_t)
+                            
+                            mix_r = min(255, int(mix_r * opacity_factor))
+                            mix_g = min(255, int(mix_g * opacity_factor))
+                            mix_b = min(255, int(mix_b * opacity_factor))
+                            core_color = f"#{mix_r:02x}{mix_g:02x}{mix_b:02x}"
+
                         history = coords[7]
                         history.insert(0, (pix_x, pix_y))
                         if len(history) > 3:
                             history.pop()
 
-                        # Render Trails if dot is moving fast enough
                         speed_px = math.sqrt((pix_x - prev_pix_x)**2 + (pix_y - prev_pix_y)**2)
                         
-                        # Trail 1 rendering (First lagged coordinate)
+                        # Trail 1 rendering
                         if len(history) > 1 and speed_px > 3:
                             t1_x, t1_y = history[1]
                             t1_radius = int(core_radius * 0.7)
@@ -451,7 +495,7 @@ class AudioRadarApp:
                         else:
                             self.canvas.coords(self.dot_ui_items[i]['trail1'], -100, -100, -100, -100)
 
-                        # Trail 2 rendering (Second lagged coordinate)
+                        # Trail 2 rendering
                         if len(history) > 2 and speed_px > 5:
                             t2_x, t2_y = history[2]
                             t2_radius = int(core_radius * 0.45)
@@ -462,9 +506,11 @@ class AudioRadarApp:
                         else:
                             self.canvas.coords(self.dot_ui_items[i]['trail2'], -100, -100, -100, -100)
 
-                        # Render main Core and Halo rings
                         self.canvas.itemconfigure(self.dot_ui_items[i]['core'], fill=core_color)
-                        self.canvas.itemconfigure(self.dot_ui_items[i]['halo'], outline=core_color)
+                        
+                        # Set halo thickness: wider rings during footstep alert
+                        halo_thickness = 2 if coords[10] > 0.15 else 1
+                        self.canvas.itemconfigure(self.dot_ui_items[i]['halo'], outline=core_color, width=halo_thickness)
                         
                         self.canvas.coords(self.dot_ui_items[i]['core'], pix_x - core_radius, pix_y - core_radius, pix_x + core_radius, pix_y + core_radius)
                         self.canvas.coords(self.dot_ui_items[i]['halo'], pix_x - halo_radius, pix_y - halo_radius, pix_x + halo_radius, pix_y + halo_radius)
@@ -478,12 +524,10 @@ class AudioRadarApp:
                     self.canvas.coords(self.dot_ui_items[i]['core'], -100, -100, -100, -100)
                     self.canvas.coords(self.dot_ui_items[i]['trail1'], -100, -100, -100, -100)
                     self.canvas.coords(self.dot_ui_items[i]['trail2'], -100, -100, -100, -100)
-                    coords[7] = []  # Clear history list when dot is inactive
+                    coords[7] = []  
         else:
             self.bar_canvas.coords(self.fill_bar, 0, 0, 0, 16)
 
-        # Force render timing callback to execute with a 4ms delay (gives a 250 FPS ceiling)
-        # This keeps CPU usage low while yielding adequate time slices to let Windows render beautifully at 120Hz/144Hz.
         self.root.after(4, self.animate_loop)
 
     def on_close(self):
