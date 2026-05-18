@@ -6,7 +6,7 @@ import sys
 import math
 import ctypes
 
-print("[SYSTEM] High-Sensitivity Manual Control Radar Initialized.")
+print("[SYSTEM] High-Sensitivity Speaker-Adaptive Radar Initialized.")
 
 class AudioRadarApp:
     def __init__(self, root):
@@ -30,10 +30,11 @@ class AudioRadarApp:
         self.text_active = False
 
         # --- MANUAL HIGH-SENSITIVITY NOISE FLOOR ---
-        # No more auto-ambient damping. This is a direct manual threshold.
         self.noise_floor = 0.0035       
         self.current_live_rms = 0.0
-        self.rolling_peak_rms = 0.010  # Dynamically auto-scales the visual bar range
+        self.smooth_live_rms = 0.0     # Smoothed signal for GUI meter
+        self.rolling_peak_rms = 0.010  
+        self.current_samplerate = 44100 # Will auto-detect speaker rate dynamically
 
         # --- GUI DASHBOARD ---
         tk.Label(root, text="RADAR MONITOR CONTROL", font=("Arial", 10, "bold"), fg="#ffffff", bg="#1e1e1e").pack(pady=6)
@@ -94,12 +95,10 @@ class AudioRadarApp:
         self.animate_loop()
 
     def increase_floor(self):
-        # Manually raise threshold (makes it less sensitive to noise)
         self.noise_floor = min(0.0300, self.noise_floor + 0.0005)
         self.floor_lbl.config(text=f"Floor: {self.noise_floor:.4f}")
 
     def decrease_floor(self):
-        # Manually lower threshold (makes it more sensitive to quiet footsteps)
         self.noise_floor = max(0.0005, self.noise_floor - 0.0005)
         self.floor_lbl.config(text=f"Floor: {self.noise_floor:.4f}")
 
@@ -135,17 +134,36 @@ class AudioRadarApp:
 
     def audio_loop(self):
         try:
+            default_speaker = sc.default_speaker()
             mics = sc.all_microphones(include_loopback=True)
-            if not mics: return
-            mic = mics[0]
-            with mic.recorder(samplerate=44100, channels=2) as recorder:
+            
+            selected_mic = None
+            for mic in mics:
+                if default_speaker.name in mic.name:
+                    selected_mic = mic
+                    break
+            
+            if selected_mic is None and len(mics) > 0:
+                selected_mic = mics[0]
+                
+            if not selected_mic:
+                print("[ERROR] No active loopback audio channels found.")
+                return
+
+            print(f"[SYSTEM] Listening to device: {selected_mic.name}")
+            
+            self.current_samplerate = int(default_speaker.id.get('latency', 44100) if isinstance(default_speaker.id, dict) else 44100)
+            if self.current_samplerate not in [44100, 48000, 96000]:
+                self.current_samplerate = 44100 
+
+            with selected_mic.recorder(samplerate=self.current_samplerate, channels=2) as recorder:
                 while self.running:
                     data = recorder.record(numframes=512)
                     if len(data) > 0:
                         self.process_spatial_audio(data)
         except Exception as e:
-            print(f"[ERROR] Audio drop: {e}")
-            self.root.after(10, self.start_radar)
+            print(f"[ERROR] Speaker Sync Lost: {e}")
+            self.root.after(1000, self.start_radar)
 
     def process_spatial_audio(self, data):
         left = data[:, 0]
@@ -156,7 +174,7 @@ class AudioRadarApp:
         
         fft_l = np.fft.rfft(left)
         fft_r = np.fft.rfft(right)
-        freqs = np.fft.rfftfreq(len(left), d=1/44100)
+        freqs = np.fft.rfftfreq(len(left), d=1/self.current_samplerate)
         
         kill_indices = np.where((freqs < 60) | (freqs > 700))[0]
         fft_l[kill_indices] = 0
@@ -168,20 +186,19 @@ class AudioRadarApp:
         total_rms = np.sqrt(np.mean(left_clean**2)) + np.sqrt(np.mean(right_clean**2))
         self.current_live_rms = total_rms
 
-        # Auto-scale the sound bar dynamically so it never stays maxed out
         self.rolling_peak_rms = max(self.rolling_peak_rms * 0.995, total_rms, 0.004)
 
-        # Active Signal Suppression Gating (Direct comparison with manual floor)
+        # --- REBUILT SUPPRESSION GATE ---
+        # Instead of a hard-clear to 0 frames, we simply return. This allows the tracking dots 
+        # to decay smoothly in the animation thread, preventing the "barely tracking" flickering bug.
         if total_rms < self.noise_floor:
             self.text_active = False
-            for i in range(self.max_slots):
-                self.tracking_slots[i][4] = 0
             return
 
         # 1. --- LOGARITHMIC SPREAD MATRIX ---
         correlation = np.correlate(left_clean - np.mean(left_clean), right_clean - np.mean(right_clean), mode='full')
         delay_sample = np.argmax(correlation) - (len(left_clean) - 1)
-        max_delay = 24
+        max_delay = int(24 * (self.current_samplerate / 44100)) 
         clamped_delay = max(-max_delay, min(max_delay, delay_sample))
         
         base_x = ((clamped_delay / max_delay) + 1.0) / 2.0 
@@ -192,7 +209,6 @@ class AudioRadarApp:
         else:
             target_x = 0.5
 
-        # Absolute Center Bubble Filter to ignore ambient mono sounds
         if 0.42 < target_x < 0.58:
             return
 
@@ -241,7 +257,7 @@ class AudioRadarApp:
             if assigned_slot != -1:
                 self.tracking_slots[assigned_slot][2] = tx
                 self.tracking_slots[assigned_slot][3] = ty
-                self.tracking_slots[assigned_slot][4] = 12 
+                self.tracking_slots[assigned_slot][4] = 16 # Slightly increased decay window for speaker tracking
                 self.tracking_slots[assigned_slot][6] = r_vol 
                 
                 if tx < 0.42: self.tracking_slots[assigned_slot][5] = "#ff4444"
@@ -269,8 +285,11 @@ class AudioRadarApp:
             self.text_active = False
 
     def animate_loop(self):
-        # Update Dashboard Visuals Focus
-        val_percentage = min(1.0, self.current_live_rms / (self.rolling_peak_rms + 1e-6))
+        # --- EMA SMOOTHING FILTER FOR SOUND BAR ---
+        # Dampens visual flickering of the volume visualizer
+        self.smooth_live_rms = 0.75 * self.smooth_live_rms + 0.25 * self.current_live_rms
+        
+        val_percentage = min(1.0, self.smooth_live_rms / (self.rolling_peak_rms + 1e-6))
         cutoff_percentage = min(1.0, self.noise_floor / (self.rolling_peak_rms + 1e-6))
         
         self.bar_canvas.coords(self.fill_bar, 0, 0, int(260 * val_percentage), 14)
@@ -279,8 +298,6 @@ class AudioRadarApp:
         if self.running:
             if self.text_active:
                 self.panel_canvas.itemconfigure(self.gui_text_tracker, text=f"ALERT REAR: {int(self.text_target_x*100)}%", fill="#ff3333")
-                
-                # Update text on desktop transparent engine
                 self.text_current_x += (self.text_target_x - self.text_current_x) * 0.20
                 text_pix_x = int(self.screen_width * self.text_current_x)
                 self.canvas.coords(self.behind_text, text_pix_x, self.screen_height - 32)
@@ -289,7 +306,6 @@ class AudioRadarApp:
                 self.panel_canvas.itemconfigure(self.gui_text_tracker, text="TRACKING", fill="#00ff66")
                 self.canvas.itemconfigure(self.behind_text, state='hidden')
 
-            # Render overlay channel dots
             mouse_x = self.root.winfo_pointerx()
             mouse_y = self.root.winfo_pointery()
             for i in range(self.max_slots):
