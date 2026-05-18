@@ -13,12 +13,15 @@ class AudioRadarApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Radar Controls")
-        self.root.geometry("340x240")
+        self.root.geometry("340x290")
         self.root.attributes("-topmost", True)
         self.root.config(bg="#121212")
         
         self.running = False
         self.audio_thread = None
+        
+        # --- MODE TOGGLE ---
+        self.overlay_mode = tk.StringVar(value="dots")  # "dots" or "ring"
         
         # --- TRACKING POOL ---
         # Format: [current_x, current_y, target_x, target_y, active_frames, base_color_name, relative_vol, history_list, current_opacity, current_size]
@@ -33,6 +36,7 @@ class AudioRadarApp:
 
         # --- NOISE FLOOR & AUDIO SETTINGS ---
         self.noise_floor = 0.0035       
+        self.adaptive_noise_floor = 0.0035  # Dynamically adapts to quiet areas
         self.current_live_rms = 0.0
         self.smooth_live_rms = 0.0     
         self.rolling_peak_rms = 0.010  
@@ -76,11 +80,21 @@ class AudioRadarApp:
                                   font=("Arial", 9, "bold"), width=12, bd=0, relief="flat", cursor="hand2")
         self.btn_more.grid(row=0, column=2, padx=6)
 
+        # Mode Selector Frame
+        mode_frame = tk.Frame(root, bg="#121212")
+        mode_frame.pack(pady=4)
+        tk.Radiobutton(mode_frame, text="Horizontal Dots", variable=self.overlay_mode, value="dots",
+                       bg="#121212", fg="#ffffff", selectcolor="#1a1a1a", activebackground="#121212", activeforeground="#ffffff",
+                       font=("Arial", 9), command=self.on_mode_change).grid(row=0, column=0, padx=12)
+        tk.Radiobutton(mode_frame, text="Directional HUD Ring", variable=self.overlay_mode, value="ring",
+                       bg="#121212", fg="#00ffcc", selectcolor="#1a1a1a", activebackground="#121212", activeforeground="#00ffcc",
+                       font=("Arial", 9), command=self.on_mode_change).grid(row=0, column=1, padx=12)
+
         # Start button
         self.start_btn = tk.Button(root, text="START MONITOR", command=self.start_radar, 
                                    bg="#00ffcc", fg="#121212", activebackground="#00cc99",
                                    font=("Arial", 10, "bold"), height=2, bd=0, relief="flat", cursor="hand2")
-        self.start_btn.pack(fill=tk.X, padx=24, pady=10)
+        self.start_btn.pack(fill=tk.X, padx=24, pady=6)
 
         # --- Overlay Setup ---
         self.overlay = tk.Toplevel(self.root)
@@ -97,6 +111,11 @@ class AudioRadarApp:
         self.screen_width = self.root.winfo_screenwidth()
         self.screen_height = self.root.winfo_screenheight()
         
+        # Geometry for Sound Ring Mode
+        self.ring_center_x = self.screen_width // 2
+        self.ring_center_y = self.screen_height // 2
+        self.ring_radius = 110  
+        
         # Restricted radius defaults to prevent dots from getting too large
         self.BASE_RADIUS = 3.2
         self.MAX_BONUS_RADIUS = 4.2  
@@ -109,6 +128,22 @@ class AudioRadarApp:
                 'trail1': self.canvas.create_oval(-100, -100, -100, -100, fill="", outline="", width=0),
                 'halo': self.canvas.create_oval(-100, -100, -100, -100, fill="", outline="#00ffff", width=1),
                 'core': self.canvas.create_oval(-100, -100, -100, -100, fill="#00ffff", outline="", width=0)
+            }
+        
+        # Pre-create Ring elements (hidden initially)
+        self.radar_center_circle = self.canvas.create_oval(
+            self.ring_center_x - self.ring_radius, self.ring_center_y - self.ring_radius,
+            self.ring_center_x + self.ring_radius, self.ring_center_y + self.ring_radius,
+            outline="#1a1a1a", width=2, state="hidden"
+        )
+        self.radar_slots = {}
+        for i in range(self.max_slots):
+            self.radar_slots[i] = {
+                'arc': self.canvas.create_arc(
+                    self.ring_center_x - self.ring_radius - 8, self.ring_center_y - self.ring_radius - 8,
+                    self.ring_center_x + self.ring_radius + 8, self.ring_center_y + self.ring_radius + 8,
+                    start=0, extent=24, outline="#00ffff", width=4, style="arc", state="hidden"
+                )
             }
         
         self.behind_text = self.canvas.create_text(
@@ -150,6 +185,9 @@ class AudioRadarApp:
             
         self.floor_lbl.config(text=f"{self.noise_floor:.4f}")
 
+    def on_mode_change(self):
+        self.hide_all()
+
     def start_radar(self):
         if not self.running:
             self.running = True
@@ -168,11 +206,18 @@ class AudioRadarApp:
             self.hide_all()
 
     def hide_all(self):
+        # Reset standard dot items
         for item in self.dot_ui_items.values():
             self.canvas.coords(item['trail2'], -100, -100, -100, -100)
             self.canvas.coords(item['trail1'], -100, -100, -100, -100)
             self.canvas.coords(item['halo'], -100, -100, -100, -100)
             self.canvas.coords(item['core'], -100, -100, -100, -100)
+            
+        # Reset ring mode items
+        self.canvas.itemconfigure(self.radar_center_circle, state="hidden")
+        for item in self.radar_slots.values():
+            self.canvas.itemconfigure(item['arc'], state="hidden")
+            
         self.canvas.itemconfigure(self.behind_text, state='hidden')
 
     def audio_loop(self):
@@ -231,7 +276,19 @@ class AudioRadarApp:
 
         self.rolling_peak_rms = max(self.rolling_peak_rms * 0.995, total_rms, 0.004)
 
-        if total_rms < self.noise_floor:
+        # --- ADAPTIVE NOISE FLOOR TRACKING ---
+        # Slowly decay the adaptive noise floor toward current RMS when quiet, allowing
+        # extreme sensitivity in silent areas but keeping high thresholds in loud zones.
+        if total_rms < self.adaptive_noise_floor:
+            self.adaptive_noise_floor = self.adaptive_noise_floor * 0.90 + total_rms * 0.10
+        else:
+            self.adaptive_noise_floor = self.adaptive_noise_floor * 0.998 + total_rms * 0.002
+        self.adaptive_noise_floor = max(0.0002, self.adaptive_noise_floor)
+
+        # In quiet areas, let the threshold automatically lower to 1.5x the ambient floor
+        effective_noise_floor = min(self.noise_floor, self.adaptive_noise_floor * 1.5)
+
+        if total_rms < effective_noise_floor:
             self.text_active = False
             return
 
@@ -243,7 +300,6 @@ class AudioRadarApp:
         
         base_x = ((clamped_delay / max_delay) + 1.0) / 2.0 
 
-        # Inverted subtraction to swap left/right panning direction correctly
         centered_x = 0.5 - base_x
         if centered_x != 0:
             expanded_x = math.copysign(math.pow(abs(centered_x) * 2.0, 0.65) * 0.5, centered_x)
@@ -262,16 +318,24 @@ class AudioRadarApp:
         freq = freqs[dom_idx]
         
         if freq >= 40:
-            # --- SPECTRAL ANOMALY FILTER (ANTI-NOISE GATE) ---
+            # --- ADAPTIVE SPECTRAL ANOMALY FILTER ---
             mean_spectral_energy = np.mean(fft_combined[fft_combined > 0]) if np.any(fft_combined > 0) else 1e-5
             peak_energy = fft_combined[dom_idx]
             
-            if peak_energy > (mean_spectral_energy * 3.5):
+            # FOOTSTEP BAND ENHANCEMENT: Slashes required prominence to 2.0x within key step frequency bands
+            is_step_band = (60.0 <= freq <= 300.0)
+            prominence_gate = 2.0 if is_step_band else 3.5
+            
+            if peak_energy > (mean_spectral_energy * prominence_gate):
                 base_y = 1.0 - (math.log10(freq) / 3.8)
                 target_y = 0.45 + (max(0.1, min(0.9, base_y)) - 0.5) * 0.25
                 
-                signal_strength = min(1.0, (total_rms - self.noise_floor) / 0.015)
-                if signal_strength > 0.12:
+                denom = max(0.002, min(0.015, total_rms * 1.8))
+                signal_strength = min(1.0, (total_rms - effective_noise_floor) / denom)
+                
+                # Slashes minimum signal barrier in quiet environments to grab very faint steps
+                min_gate = 0.04 if is_step_band else 0.12
+                if signal_strength > min_gate:
                     raw_detected_points.append((target_x, target_y, signal_strength))
 
         # 3. --- Dynamic Cluster Merging ---
@@ -317,18 +381,16 @@ class AudioRadarApp:
 
         # 5. --- ISOLATED REAR TEXT CONTEXT (HIGHLY SENSITIVE) ---
         is_real_rear_sound = False
-        if total_rms > self.noise_floor:
-            # Broaden phase correlation checks to quickly pick up subtle back-of-head indicators
+        if total_rms > effective_noise_floor:
             phase_corr = np.corrcoef(left_clean, right_clean)[0, 1] if total_rms > 0.002 else 0
-            if phase_corr < -0.15:  # Changed threshold from -0.45 to -0.15 to capture lighter phase shifts
+            if phase_corr < -0.15:  
                 is_real_rear_sound = True
                 
-            if not is_real_rear_sound and total_rms > 0.005:  # Dropped trigger level from 0.030 to 0.005
+            if not is_real_rear_sound and total_rms > 0.005:  
                 rms_ratio = min(raw_left_rms, raw_right_rms) / max(raw_left_rms, raw_right_rms + 1e-6)
                 high_freq_cutoff = np.where(freqs > 1800)[0]
                 high_freq_energy = np.sum(np.abs(fft_l[high_freq_cutoff]) + np.abs(fft_r[high_freq_cutoff]))
-                # Relaxed ratios and allowed more high frequency presence for fast, clean rear warnings
-                if rms_ratio > 0.85 and high_freq_energy < 0.015:  # rms_ratio: 0.96->0.85, HF energy limit: 0.0001->0.015
+                if rms_ratio > 0.85 and high_freq_energy < 0.015:  
                     is_real_rear_sound = True
 
         if is_real_rear_sound: 
@@ -359,117 +421,191 @@ class AudioRadarApp:
         self.bar_canvas.coords(self.line_cutoff, int(260 * cutoff_percentage), 0, int(260 * cutoff_percentage), 14)
 
         if self.running:
-            if self.text_active:
+            # Active indicator updates
+            self.panel_canvas.itemconfigure(self.gui_text_tracker, text="ACTIVE", fill="#00ffcc")
+            
+            mode = self.overlay_mode.get()
+
+            # Behind flag activation (Only used/rendered in classic "dots" mode to prevent ring mode clutter)
+            if self.text_active and mode != "ring":
                 self.panel_canvas.itemconfigure(self.gui_text_tracker, text=f"ALARM REAR: {int(self.text_target_x*100)}%", fill="#ff3333")
                 self.text_current_x += (self.text_target_x - self.text_current_x) * move_coef
+                
+                # Render behind text overlay
                 text_pix_x = int(self.screen_width * self.text_current_x)
                 self.canvas.coords(self.behind_text, text_pix_x, self.screen_height - 32)
                 self.canvas.itemconfigure(self.behind_text, state='normal')
             else:
-                self.panel_canvas.itemconfigure(self.gui_text_tracker, text="ACTIVE", fill="#00ffcc")
                 self.canvas.itemconfigure(self.behind_text, state='hidden')
 
-            mouse_x = self.root.winfo_pointerx()
-            mouse_y = self.root.winfo_pointery()
-
-            for i in range(self.max_slots):
-                coords = self.tracking_slots[i]
+            # --- RENDER LOGIC FOR DIRECTIONAL HUD RING MODE ---
+            if mode == "ring":
+                # Ensure central anchor circle is visible
+                self.canvas.itemconfigure(self.radar_center_circle, state="normal", outline="#222222")
                 
-                if coords[4] > 0:
-                    coords[4] -= 22.0 * dt  
-                    target_opacity_factor = 1.0
-                else:
-                    target_opacity_factor = 0.0
+                # Make sure normal dots are moved off-screen/hidden
+                for item in self.dot_ui_items.values():
+                    self.canvas.coords(item['trail2'], -100, -100, -100, -100)
+                    self.canvas.coords(item['trail1'], -100, -100, -100, -100)
+                    self.canvas.coords(item['halo'], -100, -100, -100, -100)
+                    self.canvas.coords(item['core'], -100, -100, -100, -100)
 
-                coords[8] += (target_opacity_factor - coords[8]) * opacity_coef
+                for i in range(self.max_slots):
+                    coords = self.tracking_slots[i]
+                    arc_item = self.radar_slots[i]['arc']
+                    
+                    if coords[4] > 0:
+                        coords[4] -= 22.0 * dt
+                        target_opacity_factor = 1.0
+                    else:
+                        target_opacity_factor = 0.0
 
-                if coords[8] > 0.01:
-                    prev_pix_x = int(self.screen_width * coords[0])
-                    prev_pix_y = int(self.screen_height * coords[1])
+                    coords[8] += (target_opacity_factor - coords[8]) * opacity_coef
+
+                    if coords[8] > 0.01:
+                        # Smooth directional coordinate interpolation
+                        coords[0] += (coords[2] - coords[0]) * move_coef
+                        
+                        # Calculate angle:
+                        # 1.0 (far left) -> 180 degrees
+                        # 0.5 (center)   -> 90 degrees (facing up/neutral)
+                        # 0.0 (far right) -> 0 degrees
+                        current_x_normalized = coords[0]
+                        angle_deg = current_x_normalized * 180.0
+                        
+                        # Setup color signature matching threat sector
+                        if coords[5] == "left":
+                            base_r, base_g, base_b = 255, 68, 68
+                        elif coords[5] == "right":
+                            base_r, base_g, base_b = 0, 238, 247
+                        else:
+                            base_r, base_g, base_b = 68, 255, 68
+                            
+                        # If behind is triggered globally, highlight slot as threat
+                        if self.text_active and abs(current_x_normalized - self.text_target_x) < 0.15:
+                            base_r, base_g, base_b = 255, 34, 34
+                            angle_deg = 270.0 # Point direct down toward the behind threat zone
+
+                        opacity_factor = 0.5 * coords[8]
+                        faded_r = int(base_r * opacity_factor)
+                        faded_g = int(base_g * opacity_factor)
+                        faded_b = int(base_b * opacity_factor)
+                        arc_color = f"#{faded_r:02x}{faded_g:02x}{faded_b:02x}"
+                        
+                        # Dynamically width scale of arcs based on threat distance/volume
+                        arc_extent = 15 + int(coords[6] * 20)
+                        arc_start = angle_deg - (arc_extent / 2)
+                        
+                        self.canvas.itemconfigure(arc_item, start=arc_start, extent=arc_extent, outline=arc_color, state="normal")
+                    else:
+                        self.canvas.itemconfigure(arc_item, state="hidden")
+
+            # --- RENDER LOGIC FOR CLASSIC HORIZONTAL DOTS MODE ---
+            else:
+                # Ensure central anchor circle and arcs are hidden
+                self.canvas.itemconfigure(self.radar_center_circle, state="hidden")
+                for item in self.radar_slots.values():
+                    self.canvas.itemconfigure(item['arc'], state="hidden")
+
+                mouse_x = self.root.winfo_pointerx()
+                mouse_y = self.root.winfo_pointery()
+
+                for i in range(self.max_slots):
+                    coords = self.tracking_slots[i]
                     
-                    coords[0] += (coords[2] - coords[0]) * move_coef
-                    coords[1] += (coords[3] - coords[1]) * move_coef
-                    
-                    pix_x = int(self.screen_width * coords[0])
-                    pix_y = int(self.screen_height * coords[1])
-                    
-                    if math.sqrt((pix_x - mouse_x)**2 + (pix_y - mouse_y)**2) < 15:
-                        coords[8] = 0.0  
+                    if coords[4] > 0:
+                        coords[4] -= 22.0 * dt  
+                        target_opacity_factor = 1.0
+                    else:
+                        target_opacity_factor = 0.0
+
+                    coords[8] += (target_opacity_factor - coords[8]) * opacity_coef
+
+                    if coords[8] > 0.01:
+                        prev_pix_x = int(self.screen_width * coords[0])
+                        prev_pix_y = int(self.screen_height * coords[1])
+                        
+                        coords[0] += (coords[2] - coords[0]) * move_coef
+                        coords[1] += (coords[3] - coords[1]) * move_coef
+                        
+                        pix_x = int(self.screen_width * coords[0])
+                        pix_y = int(self.screen_height * coords[1])
+                        
+                        if math.sqrt((pix_x - mouse_x)**2 + (pix_y - mouse_y)**2) < 15:
+                            coords[8] = 0.0  
+                            self.canvas.coords(self.dot_ui_items[i]['halo'], -100, -100, -100, -100)
+                            self.canvas.coords(self.dot_ui_items[i]['core'], -100, -100, -100, -100)
+                            self.canvas.coords(self.dot_ui_items[i]['trail1'], -100, -100, -100, -100)
+                            self.canvas.coords(self.dot_ui_items[i]['trail2'], -100, -100, -100, -100)
+                            coords[7] = []  
+                            continue
+
+                        dist_from_center = abs(coords[0] - 0.5)  
+                        edge_growth_factor = 1.0 + (dist_from_center * 0.8) 
+                        
+                        target_radius = (self.BASE_RADIUS + (coords[6] * self.MAX_BONUS_RADIUS)) * edge_growth_factor
+                        coords[9] += (target_radius - coords[9]) * size_coef  
+                        core_radius = int(coords[9])
+                        halo_radius = core_radius + 4
+                        
+                        if coords[5] == "left":
+                            base_r, base_g, base_b = 255, 68, 68
+                        elif coords[5] == "right":
+                            base_r, base_g, base_b = 0, 238, 247
+                        else:
+                            base_r, base_g, base_b = 68, 255, 68
+
+                        opacity_factor = 0.5 * coords[8]
+
+                        if opacity_factor > 0.01:
+                            faded_r = int(base_r * opacity_factor)
+                            faded_g = int(base_g * opacity_factor)
+                            faded_b = int(base_b * opacity_factor)
+                            core_color = f"#{faded_r:02x}{faded_g:02x}{faded_b:02x}"
+
+                            history = coords[7]
+                            history.insert(0, (pix_x, pix_y))
+                            if len(history) > 3:
+                                history.pop()
+
+                            speed_px = math.sqrt((pix_x - prev_pix_x)**2 + (pix_y - prev_pix_y)**2)
+                            
+                            if len(history) > 1 and speed_px > 3:
+                                t1_x, t1_y = history[1]
+                                t1_radius = int(core_radius * 0.7)
+                                t1_opacity = opacity_factor * 0.5
+                                t1_color = f"#{int(base_r * t1_opacity):02x}{int(base_g * t1_opacity):02x}{int(base_b * t1_opacity):02x}"
+                                self.canvas.itemconfigure(self.dot_ui_items[i]['trail1'], fill=t1_color, outline="")
+                                self.canvas.coords(self.dot_ui_items[i]['trail1'], t1_x - t1_radius, t1_y - t1_radius, t1_x + t1_radius, t1_y + t1_radius)
+                            else:
+                                self.canvas.coords(self.dot_ui_items[i]['trail1'], -100, -100, -100, -100)
+
+                            if len(history) > 2 and speed_px > 5:
+                                t2_x, t2_y = history[2]
+                                t2_radius = int(core_radius * 0.45)
+                                t2_opacity = opacity_factor * 0.25
+                                t2_color = f"#{int(base_r * t2_opacity):02x}{int(base_g * t2_opacity):02x}{int(base_b * t2_opacity):02x}"
+                                self.canvas.itemconfigure(self.dot_ui_items[i]['trail2'], fill=t2_color, outline="")
+                                self.canvas.coords(self.dot_ui_items[i]['trail2'], t2_x - t2_radius, t2_y - t2_radius, t2_x + t2_radius, t2_y + t2_radius)
+                            else:
+                                self.canvas.coords(self.dot_ui_items[i]['trail2'], -100, -100, -100, -100)
+
+                            self.canvas.itemconfigure(self.dot_ui_items[i]['core'], fill=core_color)
+                            self.canvas.itemconfigure(self.dot_ui_items[i]['halo'], outline=core_color)
+                            
+                            self.canvas.coords(self.dot_ui_items[i]['core'], pix_x - core_radius, pix_y - core_radius, pix_x + core_radius, pix_y + core_radius)
+                            self.canvas.coords(self.dot_ui_items[i]['halo'], pix_x - halo_radius, pix_y - halo_radius, pix_x + halo_radius, pix_y + halo_radius)
+                        else:
+                            self.canvas.coords(self.dot_ui_items[i]['halo'], -100, -100, -100, -100)
+                            self.canvas.coords(self.dot_ui_items[i]['core'], -100, -100, -100, -100)
+                            self.canvas.coords(self.dot_ui_items[i]['trail1'], -100, -100, -100, -100)
+                            self.canvas.coords(self.dot_ui_items[i]['trail2'], -100, -100, -100, -100)
+                    else:
                         self.canvas.coords(self.dot_ui_items[i]['halo'], -100, -100, -100, -100)
                         self.canvas.coords(self.dot_ui_items[i]['core'], -100, -100, -100, -100)
                         self.canvas.coords(self.dot_ui_items[i]['trail1'], -100, -100, -100, -100)
                         self.canvas.coords(self.dot_ui_items[i]['trail2'], -100, -100, -100, -100)
                         coords[7] = []  
-                        continue
-
-                    # --- FIXED SCALING WITH GENTLE SIDE-GROWTH ---
-                    dist_from_center = abs(coords[0] - 0.5)  
-                    edge_growth_factor = 1.0 + (dist_from_center * 0.8) 
-                    
-                    target_radius = (self.BASE_RADIUS + (coords[6] * self.MAX_BONUS_RADIUS)) * edge_growth_factor
-                    coords[9] += (target_radius - coords[9]) * size_coef  
-                    core_radius = int(coords[9])
-                    halo_radius = core_radius + 4
-                    
-                    if coords[5] == "left":
-                        base_r, base_g, base_b = 255, 68, 68
-                    elif coords[5] == "right":
-                        base_r, base_g, base_b = 0, 238, 247
-                    else:
-                        base_r, base_g, base_b = 68, 255, 68
-
-                    # --- ALWAYS HALF-TRANSPARENT BLEND ---
-                    opacity_factor = 0.5 * coords[8]
-
-                    if opacity_factor > 0.01:
-                        faded_r = int(base_r * opacity_factor)
-                        faded_g = int(base_g * opacity_factor)
-                        faded_b = int(base_b * opacity_factor)
-                        core_color = f"#{faded_r:02x}{faded_g:02x}{faded_b:02x}"
-
-                        history = coords[7]
-                        history.insert(0, (pix_x, pix_y))
-                        if len(history) > 3:
-                            history.pop()
-
-                        speed_px = math.sqrt((pix_x - prev_pix_x)**2 + (pix_y - prev_pix_y)**2)
-                        
-                        if len(history) > 1 and speed_px > 3:
-                            t1_x, t1_y = history[1]
-                            t1_radius = int(core_radius * 0.7)
-                            t1_opacity = opacity_factor * 0.5
-                            t1_color = f"#{int(base_r * t1_opacity):02x}{int(base_g * t1_opacity):02x}{int(base_b * t1_opacity):02x}"
-                            self.canvas.itemconfigure(self.dot_ui_items[i]['trail1'], fill=t1_color, outline="")
-                            self.canvas.coords(self.dot_ui_items[i]['trail1'], t1_x - t1_radius, t1_y - t1_radius, t1_x + t1_radius, t1_y + t1_radius)
-                        else:
-                            self.canvas.coords(self.dot_ui_items[i]['trail1'], -100, -100, -100, -100)
-
-                        if len(history) > 2 and speed_px > 5:
-                            t2_x, t2_y = history[2]
-                            t2_radius = int(core_radius * 0.45)
-                            t2_opacity = opacity_factor * 0.25
-                            t2_color = f"#{int(base_r * t2_opacity):02x}{int(base_g * t2_opacity):02x}{int(base_b * t2_opacity):02x}"
-                            self.canvas.itemconfigure(self.dot_ui_items[i]['trail2'], fill=t2_color, outline="")
-                            self.canvas.coords(self.dot_ui_items[i]['trail2'], t2_x - t2_radius, t2_y - t2_radius, t2_x + t2_radius, t2_y + t2_radius)
-                        else:
-                            self.canvas.coords(self.dot_ui_items[i]['trail2'], -100, -100, -100, -100)
-
-                        self.canvas.itemconfigure(self.dot_ui_items[i]['core'], fill=core_color)
-                        self.canvas.itemconfigure(self.dot_ui_items[i]['halo'], outline=core_color)
-                        
-                        self.canvas.coords(self.dot_ui_items[i]['core'], pix_x - core_radius, pix_y - core_radius, pix_x + core_radius, pix_y + core_radius)
-                        self.canvas.coords(self.dot_ui_items[i]['halo'], pix_x - halo_radius, pix_y - halo_radius, pix_x + halo_radius, pix_y + halo_radius)
-                    else:
-                        self.canvas.coords(self.dot_ui_items[i]['halo'], -100, -100, -100, -100)
-                        self.canvas.coords(self.dot_ui_items[i]['core'], -100, -100, -100, -100)
-                        self.canvas.coords(self.dot_ui_items[i]['trail1'], -100, -100, -100, -100)
-                        self.canvas.coords(self.dot_ui_items[i]['trail2'], -100, -100, -100, -100)
-                else:
-                    self.canvas.coords(self.dot_ui_items[i]['halo'], -100, -100, -100, -100)
-                    self.canvas.coords(self.dot_ui_items[i]['core'], -100, -100, -100, -100)
-                    self.canvas.coords(self.dot_ui_items[i]['trail1'], -100, -100, -100, -100)
-                    self.canvas.coords(self.dot_ui_items[i]['trail2'], -100, -100, -100, -100)
-                    coords[7] = []  
         else:
             self.bar_canvas.coords(self.fill_bar, 0, 0, 0, 14)
 
