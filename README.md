@@ -31,7 +31,7 @@ pip install soundcard numpy
 ### 3. Running the Application
 
 ```bash
-python radarV3Linux-test.py
+python [Drag the chosen python]
 
 ```
 
