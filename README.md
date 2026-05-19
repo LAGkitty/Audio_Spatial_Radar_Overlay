@@ -25,3 +25,19 @@ This project requires several third-party libraries for audio processing and har
 
 ```bash
 pip install soundcard numpy
+
+```
+
+### 3. Running the Application
+
+```bash
+python radarV3Linux-test.py
+
+```
+
+### 4. Linux Execution Note
+
+On Linux, you must run the application with the following environment variable to ensure the overlay displays correctly:
+
+```bash
+QT_QPA_PLATFORM=xcb python3 radarV3Linux-test.py
