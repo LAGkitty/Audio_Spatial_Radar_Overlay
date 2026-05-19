@@ -40,4 +40,4 @@ python [Drag the chosen python]
 On Linux, you must run the application with the following environment variable to ensure the overlay displays correctly:
 
 ```bash
-QT_QPA_PLATFORM=xcb python3 radarV3Linux-test.py
+QT_QPA_PLATFORM=xcb python3 [Chosen linux version]
