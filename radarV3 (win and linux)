@@ -5,6 +5,7 @@ import time
 import json
 import platform
 import numpy as np
+import math
 from collections import deque
 
 # PyQt5 handles the high-performance GUI framework and transparent click-through overlays
@@ -78,15 +79,15 @@ PRESETS = {
         "display_mode": "hud",
     },
     "FPS Casual": {
-        "sensitivity": 4.5,
-        "noise_gate": 0.018,
+        "sensitivity": 25.0,
+        "noise_gate": 0.080,
         "panning_sensitivity": 3.0,
-        "hud_width_ratio": 0.95,
+        "hud_width_ratio": 0.47,
         "overlay_y_pos": 0.40,
         "show_footstep_lock": True,
         "adaptive_gain": True,
         "use_arrows": True,
-        "responsiveness": 0.60,
+        "responsiveness": 0.26,
         "display_mode": "hud",
     },
     "Radar Mode": {
@@ -118,6 +119,7 @@ PRESETS = {
 
 class SoundPulse:
     """Represents a spatialized audio vector containing panning, intensity, depth, and footstep flags."""
+    __slots__ = ['direction', 'intensity', 'depth', 'is_footstep', 'age', 'max_age']
     def __init__(self, direction, intensity, depth, is_footstep, max_age):
         self.direction   = direction       # -1.0 (Hard Left) to 1.0 (Hard Right)
         self.intensity   = intensity       # Volume amplitude scaling
@@ -148,51 +150,40 @@ class AudioProcessor:
         self.on_device_auto_changed_callback = None
         self._find_audio_loopback()
 
+        # Precompute frequency mask to save overhead in loop
+        self.freqs = np.fft.rfftfreq(self.blocksize, d=1.0 / self.samplerate)
+        self.step_mask = ((self.freqs >= 70) & (self.freqs <= 250)) | ((self.freqs >= 1000) & (self.freqs <= 3500))
+
     # ── Device discovery ──────────────────────────────────────────────────────
 
     def _find_audio_loopback(self):
-        """
-        Dynamically identifies the active loopback output device.
-
-        Priority order (same on both platforms):
-          1. Loopback whose name matches the current default speaker
-          2. Linux:   any .monitor device (PulseAudio / PipeWire)
-             Windows: WASAPI loopback via get_microphone(id=speaker.name, include_loopback=True)
-          3. Any remaining loopback device
-          4. Default microphone as last resort
-        """
         try:
             default_speaker = sc.default_speaker()
             mics = sc.all_microphones(include_loopback=True)
 
-            # 1. Best match: loopback whose name overlaps with the default speaker
             for m in mics:
                 if getattr(m, 'isloopback', False):
                     if (default_speaker.name in m.name or m.name in default_speaker.name):
                         self.device = m
                         return
 
-            # 2a. Linux fallback – PulseAudio / PipeWire .monitor devices
             if IS_LINUX:
                 for m in mics:
                     if getattr(m, 'isloopback', False) and "monitor" in m.name.lower():
                         self.device = m
                         return
 
-            # 2b. Windows / cross-platform – ask soundcard directly for the loopback
             try:
                 self.device = sc.get_microphone(id=default_speaker.name, include_loopback=True)
                 return
             except Exception:
                 pass
 
-            # 3. Any loopback available
             for m in mics:
                 if getattr(m, 'isloopback', False):
                     self.device = m
                     return
 
-            # 4. Absolute last resort
             self.device = sc.default_microphone()
 
         except Exception as e:
@@ -200,10 +191,6 @@ class AudioProcessor:
             self.device = None
 
     def set_default_device(self):
-        """
-        Re-runs automatic loopback discovery and restarts capture on the
-        best available device. Returns the newly selected device (or None).
-        """
         self.stop()
         self._find_audio_loopback()
         if self.device:
@@ -232,10 +219,8 @@ class AudioProcessor:
     # ── Capture / processing ──────────────────────────────────────────────────
 
     def _capture_loop(self):
-        """Captures loopback buffers, computes non-linear edge panning, and runs transient classification."""
         while self.running:
             try:
-                # Watch for OS-level default speaker changes
                 try:
                     current_system_default = sc.default_speaker()
                     if self.device and getattr(self.device, 'isloopback', False):
@@ -253,7 +238,6 @@ class AudioProcessor:
 
                 with self.device.recorder(samplerate=self.samplerate, blocksize=self.blocksize) as recorder:
                     while self.running:
-                        # Break inner loop if default speaker changed
                         try:
                             current_system_default = sc.default_speaker()
                             if self.device and getattr(self.device, 'isloopback', False):
@@ -271,82 +255,65 @@ class AudioProcessor:
                         left_ch   = data[:, 0]
                         right_ch  = data[:, 1] if channels >= 2 else data[:, 0]
 
-                        # Calculate raw root-mean-square (RMS) energies
                         left_energy  = np.sqrt(np.mean(left_ch**2))
                         right_energy = np.sqrt(np.mean(right_ch**2))
                         total_energy = left_energy + right_energy
 
-                        # Dynamic Auto-Gain Control (Adaptive Audio Calibration)
                         self.volume_history.append(total_energy)
                         adaptive_multiplier = 1.0
 
                         if self.config.settings["adaptive_gain"] and len(self.volume_history) > 10:
                             avg_recent_volume = np.mean(self.volume_history)
                             if avg_recent_volume > 0.001:
-                                # Clamp adaptive scaling factor strictly between 0.4x and 3.5x
                                 adaptive_multiplier = 0.025 / avg_recent_volume
                                 adaptive_multiplier = max(0.4, min(3.5, adaptive_multiplier))
 
-                        # Target dynamic calibration for footsteps: Filter bands where steps live (70-250Hz, 1kHz-3.5kHz)
+                        # Avoid full processing calculations if completely below base gate threshold
+                        base_gate = self.config.settings["noise_gate"] + (self.ambient_noise_floor * 1.2)
+                        if total_energy < base_gate:
+                            if total_energy < self.ambient_noise_floor * 1.5:
+                                self.ambient_noise_floor = (0.99 * self.ambient_noise_floor) + (0.01 * total_energy)
+
+                            resp = self.config.settings.get("responsiveness", 0.60)
+                            self.current_direction *= (1.0 - resp)
+                            self.current_intensity *= (1.0 - resp)
+                            self.current_depth     = (self.current_depth * (1.0 - resp)) + resp
+                            self.footstep_detected = False
+                            continue
+
                         footstep_energy = 0.0
-                        for ch in [left_ch, right_ch]:
-                            fft_data = np.fft.rfft(ch)
-                            freqs    = np.fft.rfftfreq(len(ch), d=1.0 / self.samplerate)
+                        fft_l = np.fft.rfft(left_ch)
+                        footstep_energy += np.sqrt(np.mean(np.abs(fft_l[self.step_mask])**2))
+                        if channels >= 2:
+                            fft_r = np.fft.rfft(right_ch)
+                            footstep_energy += np.sqrt(np.mean(np.abs(fft_r[self.step_mask])**2))
+                            footstep_energy /= 2.0
 
-                            step_mask       = ((freqs >= 70) & (freqs <= 250)) | ((freqs >= 1000) & (freqs <= 3500))
-                            footstep_energy += np.sqrt(np.mean(np.abs(fft_data[step_mask])**2))
-
-                        footstep_energy /= 2.0
-
-                        # Track moving averages to isolate transient spikes (sudden footsteps) from static noise
                         self.footstep_energy_history.append(footstep_energy)
-                        avg_footstep_energy = (np.mean(self.footstep_energy_history)
-                                               if len(self.footstep_energy_history) > 0 else 0.0)
+                        avg_footstep_energy = np.mean(self.footstep_energy_history) if self.footstep_energy_history else 0.0
 
-                        # Update continuous ambient noise tracking
                         if total_energy < self.ambient_noise_floor * 1.5:
                             self.ambient_noise_floor = (0.99 * self.ambient_noise_floor) + (0.01 * total_energy)
 
-                        gate_threshold = self.config.settings["noise_gate"] + (self.ambient_noise_floor * 1.2)
+                        raw_panning = (right_energy - left_energy) / (total_energy + 1e-6)
+                        pan_sign      = np.sign(raw_panning)
+                        boosted_pan   = pan_sign * (abs(raw_panning) ** 0.4)
 
-                        # Spatial Panning Engine with non-linear edge boost curve
-                        target_direction = 0.0
-                        target_depth     = 1.0
-                        is_footstep      = False
+                        target_direction = boosted_pan * self.config.settings["panning_sensitivity"]
+                        target_direction = max(-1.0, min(1.0, target_direction))
 
-                        if total_energy > gate_threshold:
-                            # Standard pan ratio
-                            raw_panning = (right_energy - left_energy) / (total_energy + 1e-6)
-
-                            # Dynamic Panning Curve: power function pushes small panning values to the sides
-                            pan_sign      = np.sign(raw_panning)
-                            pan_magnitude = abs(raw_panning)
-                            boosted_pan   = pan_sign * (pan_magnitude ** 0.4)
-
-                            target_direction = boosted_pan * self.config.settings["panning_sensitivity"]
-                            target_direction = max(-1.0, min(1.0, target_direction))
-
-                            # Phase analysis for depth (out-of-phase = behind cue)
-                            dot_product  = np.sum(left_ch * right_ch)
-                            norm_left    = np.sum(left_ch ** 2)
-                            norm_right   = np.sum(right_ch ** 2)
-                            if norm_left > 1e-6 and norm_right > 1e-6:
-                                correlation = dot_product / (np.sqrt(norm_left * norm_right) + 1e-6)
-                            else:
-                                correlation = 1.0
-                            target_depth = correlation
-
-                            # Footstep classifier transient trigger
-                            if avg_footstep_energy > 0.001 and footstep_energy > (avg_footstep_energy * 2.1):
-                                is_footstep = True
-
-                            target_intensity = min(1.0, total_energy * self.config.settings["sensitivity"] * adaptive_multiplier)
+                        dot_product  = np.sum(left_ch * right_ch)
+                        norm_left    = np.sum(left_ch ** 2)
+                        norm_right   = np.sum(right_ch ** 2)
+                        if norm_left > 1e-6 and norm_right > 1e-6:
+                            correlation = dot_product / (math.sqrt(norm_left * norm_right) + 1e-6)
                         else:
-                            target_intensity = 0.0
-                            target_direction = 0.0
-                            target_depth     = 1.0
+                            correlation = 1.0
+                        target_depth = correlation
 
-                        # Apply responsiveness smoothing
+                        is_footstep = avg_footstep_energy > 0.001 and footstep_energy > (avg_footstep_energy * 2.1)
+                        target_intensity = min(1.0, total_energy * self.config.settings["sensitivity"] * adaptive_multiplier)
+
                         resp = self.config.settings.get("responsiveness", 0.60)
                         self.current_direction = (self.current_direction * (1.0 - resp)) + (target_direction * resp)
                         self.current_intensity = (self.current_intensity * (1.0 - resp)) + (target_intensity * resp)
@@ -373,141 +340,33 @@ class SettingsWindow(QtWidgets.QMainWindow):
         self.setStyleSheet(self.get_stylesheet())
         self.init_ui()
 
-    # ── Stylesheet ────────────────────────────────────────────────────────────
-
     def get_stylesheet(self):
         return """
-            QMainWindow {
-                background-color: #050508;
-            }
-            QWidget {
-                color: #e2e8f0;
-                font-family: 'Consolas', 'Segoe UI', monospace;
-            }
-            QLabel {
-                font-size: 11px;
-                color: #94a3b8;
-            }
-            QGroupBox {
-                border: 1px solid #141b2d;
-                border-radius: 8px;
-                margin-top: 15px;
-                font-weight: bold;
-                font-size: 11px;
-                color: #00f0ff;
-                padding-top: 15px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 5px;
-            }
-            QSlider::groove:horizontal {
-                border: 1px solid #141b2d;
-                height: 6px;
-                background: #0d111a;
-                border-radius: 3px;
-            }
-            QSlider::handle:horizontal {
-                background: #00f0ff;
-                border: 1px solid #38bdf8;
-                width: 14px;
-                height: 14px;
-                margin-top: -4px;
-                margin-bottom: -4px;
-                border-radius: 7px;
-            }
-            QSlider::handle:horizontal:hover {
-                background: #38bdf8;
-            }
-            QComboBox {
-                background-color: #090d16;
-                border: 1px solid #141b2d;
-                border-radius: 6px;
-                padding: 6px;
-                color: #e2e8f0;
-                font-size: 11px;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #050508;
-                border: 1px solid #141b2d;
-                selection-background-color: #00f0ff;
-                selection-color: #050508;
-            }
-            QPushButton {
-                background-color: #090d16;
-                border: 1px solid #00f0ff;
-                color: #00f0ff;
-                padding: 9px;
-                border-radius: 6px;
-                font-weight: bold;
-                font-size: 11px;
-            }
-            QPushButton:hover {
-                background-color: #00f0ff;
-                color: #050508;
-            }
-            QPushButton#defaultBtn {
-                border-color: #39ff14;
-                color: #39ff14;
-            }
-            QPushButton#defaultBtn:hover {
-                background-color: #39ff14;
-                color: #050508;
-            }
-            QPushButton#resetBtn {
-                border-color: #ff6b35;
-                color: #ff6b35;
-            }
-            QPushButton#resetBtn:hover {
-                background-color: #ff6b35;
-                color: #050508;
-            }
-            QPushButton#presetBtn {
-                border-color: #a855f7;
-                color: #a855f7;
-                padding: 7px;
-                font-size: 10px;
-            }
-            QPushButton#presetBtn:hover {
-                background-color: #a855f7;
-                color: #050508;
-            }
-            QRadioButton {
-                spacing: 8px;
-                font-size: 11px;
-                color: #e2e8f0;
-            }
-            QRadioButton::indicator {
-                width: 14px;
-                height: 14px;
-                border: 1px solid #141b2d;
-                border-radius: 7px;
-                background: #090d16;
-            }
-            QRadioButton::indicator:checked {
-                background: #00f0ff;
-                border: 1px solid #38bdf8;
-            }
-            QCheckBox {
-                spacing: 8px;
-                font-size: 11px;
-                color: #e2e8f0;
-            }
-            QCheckBox::indicator {
-                width: 16px;
-                height: 16px;
-                border: 1px solid #141b2d;
-                border-radius: 4px;
-                background: #090d16;
-            }
-            QCheckBox::indicator:checked {
-                background: #00f0ff;
-                border: 1px solid #38bdf8;
-            }
+            QMainWindow { background-color: #050508; }
+            QWidget { color: #e2e8f0; font-family: 'Consolas', 'Segoe UI', monospace; }
+            QLabel { font-size: 11px; color: #94a3b8; }
+            QGroupBox { border: 1px solid #141b2d; border-radius: 8px; margin-top: 15px; font-weight: bold; font-size: 11px; color: #00f0ff; padding-top: 15px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 5px; }
+            QSlider::groove:horizontal { border: 1px solid #141b2d; height: 6px; background: #0d111a; border-radius: 3px; }
+            QSlider::handle:horizontal { background: #00f0ff; border: 1px solid #38bdf8; width: 14px; height: 14px; margin-top: -4px; margin-bottom: -4px; border-radius: 7px; }
+            QSlider::handle:horizontal:hover { background: #38bdf8; }
+            QComboBox { background-color: #090d16; border: 1px solid #141b2d; border-radius: 6px; padding: 6px; color: #e2e8f0; font-size: 11px; }
+            QComboBox QAbstractItemView { background-color: #050508; border: 1px solid #141b2d; selection-background-color: #00f0ff; selection-color: #050508; }
+            QPushButton { background-color: #090d16; border: 1px solid #00f0ff; color: #00f0ff; padding: 9px; border-radius: 6px; font-weight: bold; font-size: 11px; }
+            QPushButton:hover { background-color: #00f0ff; color: #050508; }
+            QPushButton#defaultBtn { border-color: #39ff14; color: #39ff14; }
+            QPushButton#defaultBtn:hover { background-color: #39ff14; color: #050508; }
+            QPushButton#resetBtn { border-color: #ff6b35; color: #ff6b35; }
+            QPushButton#resetBtn:hover { background-color: #ff6b35; color: #050508; }
+            QPushButton#presetBtn { border-color: #a855f7; color: #a855f7; padding: 7px; font-size: 10px; }
+            QPushButton#presetBtn:hover { background-color: #a855f7; color: #050508; }
+            QRadioButton { spacing: 8px; font-size: 11px; color: #e2e8f0; }
+            QRadioButton::indicator { width: 14px; height: 14px; border: 1px solid #141b2d; border-radius: 7px; background: #090d16; }
+            QRadioButton::indicator:checked { background: #00f0ff; border: 1px solid #38bdf8; }
+            QCheckBox { spacing: 8px; font-size: 11px; color: #e2e8f0; }
+            QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #141b2d; border-radius: 4px; background: #090d16; }
+            QCheckBox::indicator:checked { background: #00f0ff; border: 1px solid #38bdf8; }
         """
-
-    # ── UI construction ───────────────────────────────────────────────────────
 
     def init_ui(self):
         central_widget = QtWidgets.QWidget()
@@ -515,15 +374,11 @@ class SettingsWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(central_widget)
         layout.setSpacing(12)
 
-        # Cyber title panel
         title_label = QtWidgets.QLabel("SPATIAL AUDIO RADAR")
-        title_label.setStyleSheet(
-            "font-size: 16px; font-weight: bold; color: #00f0ff; letter-spacing: 4px; padding: 5px;"
-        )
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #00f0ff; letter-spacing: 4px; padding: 5px;")
         title_label.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(title_label)
 
-        # ── Audio routing group ───────────────────────────────────────────────
         audio_group  = QtWidgets.QGroupBox("Audio Device Routing")
         audio_layout = QtWidgets.QVBoxLayout(audio_group)
 
@@ -531,19 +386,13 @@ class SettingsWindow(QtWidgets.QMainWindow):
         self.device_combo.currentIndexChanged.connect(self.on_device_changed)
         audio_layout.addWidget(self.device_combo)
 
-        # Row: Refresh  +  Set to Default
         device_btn_row = QtWidgets.QHBoxLayout()
-
         refresh_btn = QtWidgets.QPushButton("⟳  Refresh Devices")
         refresh_btn.clicked.connect(self._refresh_and_keep_selection)
         device_btn_row.addWidget(refresh_btn)
 
         default_btn = QtWidgets.QPushButton("★  Set to Default")
         default_btn.setObjectName("defaultBtn")
-        default_btn.setToolTip(
-            "Auto-select the best loopback device for your current audio output.\n"
-            "Prioritises the active system speaker, then monitor/WASAPI loopbacks."
-        )
         default_btn.clicked.connect(self.on_set_default_device)
         device_btn_row.addWidget(default_btn)
 
@@ -551,13 +400,12 @@ class SettingsWindow(QtWidgets.QMainWindow):
         self.refresh_devices()
         layout.addWidget(audio_group)
 
-        # ── Slider settings group ─────────────────────────────────────────────
         ctrl_group  = QtWidgets.QGroupBox("Essential Settings")
         ctrl_layout = QtWidgets.QGridLayout(ctrl_group)
         ctrl_layout.setSpacing(10)
 
         self.row_counter = 0
-        self.slider_refs = {}  # key → (slider, val_lbl, factor, decimals)
+        self.slider_refs = {}
 
         def add_config_slider(label, key, min_val, max_val, factor, decimals):
             lbl    = QtWidgets.QLabel(label)
@@ -591,7 +439,6 @@ class SettingsWindow(QtWidgets.QMainWindow):
 
         layout.addWidget(ctrl_group)
 
-        # ── Feature toggles ───────────────────────────────────────────────────
         feature_group  = QtWidgets.QGroupBox("Radar Options")
         feature_layout = QtWidgets.QVBoxLayout(feature_group)
         feature_layout.setSpacing(10)
@@ -613,7 +460,6 @@ class SettingsWindow(QtWidgets.QMainWindow):
 
         layout.addWidget(feature_group)
 
-        # ── Display Mode ──────────────────────────────────────────────────────
         mode_group  = QtWidgets.QGroupBox("Display Mode")
         mode_layout = QtWidgets.QHBoxLayout(mode_group)
 
@@ -631,7 +477,6 @@ class SettingsWindow(QtWidgets.QMainWindow):
         mode_layout.addWidget(self.mode_radar_rb)
         layout.addWidget(mode_group)
 
-        # ── Presets ───────────────────────────────────────────────────────────
         preset_group  = QtWidgets.QGroupBox("Quick Presets")
         preset_layout = QtWidgets.QGridLayout(preset_group)
         preset_layout.setSpacing(8)
@@ -640,28 +485,22 @@ class SettingsWindow(QtWidgets.QMainWindow):
         for i, name in enumerate(preset_names):
             btn = QtWidgets.QPushButton(name)
             btn.setObjectName("presetBtn")
-            btn.setToolTip(f"Load the '{name}' preset")
             btn.clicked.connect(lambda checked, n=name: self.apply_preset(n))
             preset_layout.addWidget(btn, i // 2, i % 2)
 
         layout.addWidget(preset_group)
 
-        # ── Action row ────────────────────────────────────────────────────────
         action_layout = QtWidgets.QHBoxLayout()
-
         color_btn = QtWidgets.QPushButton("🎨  HUD Theme Color")
         color_btn.clicked.connect(self.choose_color)
         action_layout.addWidget(color_btn)
 
         reset_btn = QtWidgets.QPushButton("↺  Reset to Defaults")
         reset_btn.setObjectName("resetBtn")
-        reset_btn.setToolTip("Restore all settings to factory defaults")
         reset_btn.clicked.connect(self.reset_to_defaults)
         action_layout.addWidget(reset_btn)
-
         layout.addLayout(action_layout)
 
-        # ── Status label ──────────────────────────────────────────────────────
         self.dev_label = QtWidgets.QLabel("Routing: Searching audio hardware loop...")
         self.dev_label.setAlignment(QtCore.Qt.AlignCenter)
         self.dev_label.setStyleSheet("font-size: 10px; color: #38bdf8; margin-top: 3px;")
@@ -669,8 +508,6 @@ class SettingsWindow(QtWidgets.QMainWindow):
 
         if self.audio_processor.device:
             self.dev_label.setText(f"Active Device: {self.audio_processor.device.name}")
-
-    # ── Slots ─────────────────────────────────────────────────────────────────
 
     def on_footstep_toggled(self, state):
         self.config.settings["show_footstep_lock"] = (state == QtCore.Qt.Checked)
@@ -685,15 +522,9 @@ class SettingsWindow(QtWidgets.QMainWindow):
         self.config.save()
 
     def on_set_default_device(self):
-        """
-        Auto-selects the best loopback device using the same priority logic
-        as startup, then updates the combo-box and status label.
-        """
         new_device = self.audio_processor.set_default_device()
         self.refresh_devices()
-
         if new_device:
-            # Sync combo selection without firing on_device_changed again
             self.device_combo.blockSignals(True)
             for idx, dev in enumerate(self.audio_devices):
                 if dev.name == new_device.name:
@@ -708,7 +539,6 @@ class SettingsWindow(QtWidgets.QMainWindow):
         self.device_combo.blockSignals(True)
         self.device_combo.clear()
         self.audio_devices = []
-
         try:
             mics = sc.all_microphones(include_loopback=True)
             for m in mics:
@@ -725,12 +555,10 @@ class SettingsWindow(QtWidgets.QMainWindow):
                 if dev.name == self.audio_processor.device.name:
                     active_index = idx
                     break
-
         self.device_combo.setCurrentIndex(active_index)
         self.device_combo.blockSignals(False)
 
     def _refresh_and_keep_selection(self):
-        """Refresh the device list while preserving the current active device selection."""
         self.refresh_devices()
         if self.audio_processor.device:
             self.dev_label.setText(f"Active Device: {self.audio_processor.device.name}")
@@ -768,17 +596,14 @@ class SettingsWindow(QtWidgets.QMainWindow):
             self.config.settings[k] = v
         self.config.save()
         self.refresh_all_ui()
-        self.dev_label.setText(f"Preset loaded: {name}")
 
     def reset_to_defaults(self):
         for k, v in self.config.defaults.items():
             self.config.settings[k] = v
         self.config.save()
         self.refresh_all_ui()
-        self.dev_label.setText("Settings reset to factory defaults.")
 
     def refresh_all_ui(self):
-        """Sync all sliders, checkboxes, and radio buttons to current config."""
         for key, (slider, val_lbl, factor, decimals) in self.slider_refs.items():
             val = self.config.settings.get(key, 0)
             slider.blockSignals(True)
@@ -819,32 +644,31 @@ class OverlayWindow(QtWidgets.QWidget):
         self.audio_processor = audio_processor
         self.config          = config
         self.pulses          = deque()
-        self.radar_sweep_angle = -90.0   # degrees; -90 = pointing up (12 o'clock)
+        self.radar_sweep_angle = -90.0
+
+        # Pre-allocated reusable graphics elements to eliminate heap churn
+        self.cached_point = QtCore.QPointF()
+        self.cached_rect  = QtCore.QRectF()
+        self.arrow_poly   = QtGui.QPolygonF([QtCore.QPointF(), QtCore.QPointF(), QtCore.QPointF()])
 
         self.init_overlay()
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.tick)
-        self.timer.start(8)  # ~120 Hz refresh
+        # Cap overlay ticks to 16ms (~60Hz) to save desktop composition and GPU overhead
+        self.timer.start(16)
 
     def init_overlay(self):
-        """
-        Applies click-through, frameless, always-on-top window flags.
-        Uses BypassWindowManagerHint on Linux and Win32 style bits on Windows.
-        """
         flags = (
             QtCore.Qt.WindowStaysOnTopHint |
             QtCore.Qt.FramelessWindowHint  |
             QtCore.Qt.WindowTransparentForInput |
             QtCore.Qt.ToolTip
         )
-
         if IS_LINUX:
-            # X11 / Wayland: bypass the window manager so it floats above everything
             flags |= QtCore.Qt.BypassWindowManagerHint
 
         self.setWindowFlags(flags)
-
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground,      True)
         self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents,  True)
         self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating,      True)
@@ -853,7 +677,6 @@ class OverlayWindow(QtWidgets.QWidget):
         self.setGeometry(screen)
 
         if IS_WINDOWS:
-            # Apply WS_EX_LAYERED | WS_EX_TRANSPARENT via Win32 API for true click-through
             try:
                 import ctypes
                 hwnd   = int(self.winId())
@@ -867,10 +690,11 @@ class OverlayWindow(QtWidgets.QWidget):
 
     def tick(self):
         max_trail_age = 15
-        for p in list(self.pulses):
+        while self.pulses and self.pulses[0].age > max_trail_age:
+            self.pulses.popleft()
+
+        for p in self.pulses:
             p.age += 1
-            if p.age > max_trail_age:
-                self.pulses.popleft()
 
         intensity = self.audio_processor.current_intensity
         if intensity > 0.01:
@@ -882,23 +706,20 @@ class OverlayWindow(QtWidgets.QWidget):
                 max_age      = max_trail_age
             ))
 
-        # Advance radar sweep (~1.8 RPM  at 120 Hz refresh)
-        self.radar_sweep_angle = (self.radar_sweep_angle + 1.8) % 360.0
-
+        # Balanced speed adjustment matching the new 60Hz intervals
+        self.radar_sweep_angle = (self.radar_sweep_angle + 3.6) % 360.0
         self.update()
 
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
 
-        mode = self.config.settings.get("display_mode", "hud")
-        if mode == "radar":
+        if self.config.settings.get("display_mode", "hud") == "radar":
             self.paint_radar_mode(painter)
         else:
             self.paint_hud_mode(painter)
 
     def paint_hud_mode(self, painter):
-
         settings         = self.config.settings
         width            = self.width()
         height           = self.height()
@@ -908,9 +729,7 @@ class OverlayWindow(QtWidgets.QWidget):
         hud_active_width = width  * settings["hud_width_ratio"]
         depth_scale      = 120.0
 
-        # Horizontal layout alignment marker
         subtle_pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 10))
-        subtle_pen.setWidth(1)
         painter.setPen(subtle_pen)
         painter.drawLine(
             int(hud_center_x - hud_active_width / 2), int(hud_center_y),
@@ -919,94 +738,78 @@ class OverlayWindow(QtWidgets.QWidget):
 
         base_color = QtGui.QColor(settings["dot_color"])
 
-        # Render tracking vectors
         for pulse in self.pulses:
             age_factor = 1.0 - (pulse.age / pulse.max_age)
-            alpha      = int(255 * age_factor * pulse.intensity * 0.85)
-            alpha      = max(0, min(255, alpha))
+            alpha      = int(204 * age_factor * pulse.intensity) # Optimized alpha baseline
+            if alpha <= 0: continue
 
             pulse_color = QtGui.QColor(255, 69, 0) if pulse.depth < -0.15 else QtGui.QColor(base_color)
             pulse_color.setAlpha(alpha)
 
             x_pos          = hud_center_x + (pulse.direction * (hud_active_width / 2))
-            y_offset       = -1.0 * pulse.depth * depth_scale
-            y_pos          = hud_center_y + y_offset
+            y_pos          = hud_center_y + (-1.0 * pulse.depth * depth_scale)
             current_dot_size = 22.0 * (0.5 + 0.5 * age_factor) * (0.8 + 0.4 * pulse.intensity)
 
             is_panned = abs(pulse.direction) > 0.15
 
             if settings.get("use_arrows", True) and is_panned:
-                # Arrow mode: no outer glow rings
                 painter.setPen(QtCore.Qt.NoPen)
-                arrow_color = QtGui.QColor(pulse_color)
-                arrow_color.setAlpha(alpha)
-                painter.setBrush(QtGui.QBrush(arrow_color))
+                painter.setBrush(QtGui.QBrush(pulse_color))
 
                 arrow_size = 20.0 * (0.5 + 0.5 * age_factor) * (0.8 + 0.4 * pulse.intensity)
-                arrow_poly = QtGui.QPolygonF()
 
                 if pulse.direction < 0:
-                    # Pointing Left
-                    arrow_poly.append(QtCore.QPointF(x_pos - arrow_size,         y_pos))
-                    arrow_poly.append(QtCore.QPointF(x_pos + arrow_size * 0.4,   y_pos - arrow_size * 0.55))
-                    arrow_poly.append(QtCore.QPointF(x_pos + arrow_size * 0.4,   y_pos + arrow_size * 0.55))
+                    self.arrow_poly[0] = QtCore.QPointF(x_pos - arrow_size,       y_pos)
+                    self.arrow_poly[1] = QtCore.QPointF(x_pos + arrow_size * 0.4, y_pos - arrow_size * 0.55)
+                    self.arrow_poly[2] = QtCore.QPointF(x_pos + arrow_size * 0.4, y_pos + arrow_size * 0.55)
                 else:
-                    # Pointing Right
-                    arrow_poly.append(QtCore.QPointF(x_pos + arrow_size,         y_pos))
-                    arrow_poly.append(QtCore.QPointF(x_pos - arrow_size * 0.4,   y_pos - arrow_size * 0.55))
-                    arrow_poly.append(QtCore.QPointF(x_pos - arrow_size * 0.4,   y_pos + arrow_size * 0.55))
+                    self.arrow_poly[0] = QtCore.QPointF(x_pos + arrow_size,       y_pos)
+                    self.arrow_poly[1] = QtCore.QPointF(x_pos - arrow_size * 0.4, y_pos - arrow_size * 0.55)
+                    self.arrow_poly[2] = QtCore.QPointF(x_pos - arrow_size * 0.4, y_pos + arrow_size * 0.55)
 
-                painter.drawPolygon(arrow_poly)
-
+                painter.drawPolygon(self.arrow_poly)
             else:
-                # Standard mode: glow ring + solid centre dot
                 painter.setBrush(QtCore.Qt.NoBrush)
                 glow_pen = QtGui.QPen(pulse_color)
                 glow_pen.setWidth(2)
                 painter.setPen(glow_pen)
-                painter.drawEllipse(QtCore.QPointF(x_pos, y_pos), current_dot_size, current_dot_size)
+                self.cached_point.setX(x_pos)
+                self.cached_point.setY(y_pos)
+                painter.drawEllipse(self.cached_point, current_dot_size, current_dot_size)
 
-                solid_color = QtGui.QColor(pulse_color)
-                solid_color.setAlpha(int(alpha * 0.7))
-                painter.setBrush(QtGui.QBrush(solid_color))
+                pulse_color.setAlpha(int(alpha * 0.7))
+                painter.setBrush(QtGui.QBrush(pulse_color))
                 painter.setPen(QtCore.Qt.NoPen)
-                painter.drawEllipse(QtCore.QPointF(x_pos, y_pos), current_dot_size * 0.45, current_dot_size * 0.45)
+                painter.drawEllipse(self.cached_point, current_dot_size * 0.45, current_dot_size * 0.45)
 
-            # Footstep transient marker
             if pulse.is_footstep and settings["show_footstep_lock"]:
                 step_color = QtGui.QColor(57, 255, 20, alpha)
-
                 painter.setBrush(QtCore.Qt.NoBrush)
                 step_pen = QtGui.QPen(step_color)
                 step_pen.setWidth(2)
                 painter.setPen(step_pen)
 
                 target_radius = current_dot_size * 1.6
-                painter.drawEllipse(QtCore.QPointF(x_pos, y_pos), target_radius, target_radius)
+                self.cached_point.setX(x_pos)
+                self.cached_point.setY(y_pos)
+                painter.drawEllipse(self.cached_point, target_radius, target_radius)
 
-                # Crosshair tick marks
-                painter.drawLine(int(x_pos - target_radius - 4), int(y_pos),
-                                 int(x_pos - target_radius + 2), int(y_pos))
-                painter.drawLine(int(x_pos + target_radius - 2), int(y_pos),
-                                 int(x_pos + target_radius + 4), int(y_pos))
-                painter.drawLine(int(x_pos), int(y_pos - target_radius - 4),
-                                 int(x_pos), int(y_pos - target_radius + 2))
-                painter.drawLine(int(x_pos), int(y_pos - target_radius - 2),
-                                 int(x_pos), int(y_pos + target_radius + 4))
+                ix, iy = int(x_pos), int(y_pos)
+                ir = int(target_radius)
+                painter.drawLine(ix - ir - 4, iy, ix - ir + 2, iy)
+                painter.drawLine(ix + ir - 2, iy, ix + ir + 4, iy)
+                painter.drawLine(ix, iy - ir - 4, ix, iy - ir + 2)
+                painter.drawLine(ix, iy - ir - 2, ix, iy + ir + 4)
 
-                # Warning text above marker
                 font = painter.font()
                 font.setPointSize(9)
                 font.setBold(True)
                 painter.setFont(font)
                 painter.setPen(step_color)
-                rect = QtCore.QRectF(x_pos - 80, y_pos - target_radius - 22, 160, 18)
-                painter.drawText(rect, QtCore.Qt.AlignCenter, "WALKING / STEP")
+                self.cached_rect.setRect(x_pos - 80, y_pos - target_radius - 22, 160, 18)
+                painter.drawText(self.cached_rect, QtCore.Qt.AlignCenter, "WALKING / STEP")
 
     def paint_radar_mode(self, painter):
-        """Renders a circular rotating-sweep radar in the corner of the screen."""
-        import math
-
         settings  = self.config.settings
         width     = self.width()
         height    = self.height()
@@ -1015,56 +818,48 @@ class OverlayWindow(QtWidgets.QWidget):
         cx        = int(width  * settings.get("radar_x_pos", 0.85))
         cy        = int(height * settings.get("radar_y_pos", 0.85))
 
-        # ── Background disc ────────────────────────────────────────────────
+        self.cached_point.setX(cx)
+        self.cached_point.setY(cy)
+
         bg_color = QtGui.QColor(0, 12, 4, 200)
         painter.setBrush(QtGui.QBrush(bg_color))
         painter.setPen(QtCore.Qt.NoPen)
-        painter.drawEllipse(QtCore.QPointF(cx, cy), radar_r, radar_r)
+        painter.drawEllipse(self.cached_point, radar_r, radar_r)
 
-        # ── Grid rings ─────────────────────────────────────────────────────
         ring_pen = QtGui.QPen(QtGui.QColor(0, 180, 60, 55))
-        ring_pen.setWidth(1)
         painter.setPen(ring_pen)
         painter.setBrush(QtCore.Qt.NoBrush)
-        for frac in [0.33, 0.66, 1.0]:
-            r = radar_r * frac
-            painter.drawEllipse(QtCore.QPointF(cx, cy), r, r)
+        painter.drawEllipse(self.cached_point, radar_r * 0.33, radar_r * 0.33)
+        painter.drawEllipse(self.cached_point, radar_r * 0.66, radar_r * 0.66)
+        painter.drawEllipse(self.cached_point, radar_r, radar_r)
 
-        # ── Crosshair lines ────────────────────────────────────────────────
         cross_pen = QtGui.QPen(QtGui.QColor(0, 180, 60, 40))
-        cross_pen.setWidth(1)
         painter.setPen(cross_pen)
-        painter.drawLine(int(cx - radar_r), cy, int(cx + radar_r), cy)
-        painter.drawLine(cx, int(cy - radar_r), cx, int(cy + radar_r))
+        painter.drawLine(cx - radar_r, cy, cx + radar_r, cy)
+        painter.drawLine(cx, cy - radar_r, cx, cy + radar_r)
 
-        # ── Outer border ring ──────────────────────────────────────────────
         border_pen = QtGui.QPen(QtGui.QColor(0, 220, 80, 180))
         border_pen.setWidth(2)
         painter.setPen(border_pen)
-        painter.setBrush(QtCore.Qt.NoBrush)
-        painter.drawEllipse(QtCore.QPointF(cx, cy), radar_r, radar_r)
+        painter.drawEllipse(self.cached_point, radar_r, radar_r)
 
-        # ── Sweep cone (fading pie wedge) ──────────────────────────────────
-        sweep_deg  = self.radar_sweep_angle   # current tip angle (0=right, CCW)
-        cone_span  = 60                        # degrees of fading trail
-        grad       = QtGui.QConicalGradient(cx, cy, -sweep_deg)
+        sweep_deg  = self.radar_sweep_angle
+        cone_span  = 60
+        grad       = QtGui.QConicalGradient(self.cached_point, -sweep_deg)
         grad.setColorAt(0.0,  QtGui.QColor(0, 255, 80, 130))
-        grad.setColorAt(float(cone_span) / 360.0, QtGui.QColor(0, 255, 80, 0))
+        grad.setColorAt(cone_span / 360.0, QtGui.QColor(0, 255, 80, 0))
         grad.setColorAt(1.0,  QtGui.QColor(0, 255, 80, 0))
         painter.setBrush(QtGui.QBrush(grad))
         painter.setPen(QtCore.Qt.NoPen)
-        # Draw as clipped ellipse fill
+
         painter.save()
         clip_path = QtGui.QPainterPath()
-        clip_path.addEllipse(QtCore.QPointF(cx, cy), radar_r, radar_r)
+        clip_path.addEllipse(self.cached_point, radar_r, radar_r)
         painter.setClipPath(clip_path)
-        rect = QtCore.QRectF(cx - radar_r, cy - radar_r, radar_r * 2, radar_r * 2)
-        start_angle = int((-sweep_deg) * 16)
-        span_angle  = int(-cone_span * 16)
-        painter.drawPie(rect, start_angle, span_angle)
+        self.cached_rect.setRect(cx - radar_r, cy - radar_r, radar_r * 2, radar_r * 2)
+        painter.drawPie(self.cached_rect, int((-sweep_deg) * 16), int(-cone_span * 16))
         painter.restore()
 
-        # ── Sweep tip line ─────────────────────────────────────────────────
         sweep_rad  = math.radians(sweep_deg)
         tip_x      = cx + radar_r * math.cos(sweep_rad)
         tip_y      = cy + radar_r * math.sin(sweep_rad)
@@ -1073,19 +868,14 @@ class OverlayWindow(QtWidgets.QWidget):
         painter.setPen(tip_pen)
         painter.drawLine(cx, cy, int(tip_x), int(tip_y))
 
-        # ── Audio blips ────────────────────────────────────────────────────
-        # Map: direction (-1..1) → angle offset from top (-90..+90°)
-        # depth (+1=front/top, -1=behind/bottom) → Y axis
         for pulse in self.pulses:
             age_factor = 1.0 - (pulse.age / pulse.max_age)
             alpha      = int(200 * age_factor * (0.5 + 0.5 * pulse.intensity))
-            alpha      = max(0, min(255, alpha))
+            if alpha <= 0: continue
 
-            # Convert direction/depth → polar offset within radar circle
             bx = cx + (radar_r * 0.82) * pulse.direction
             by = cy - (radar_r * 0.70) * pulse.depth
 
-            # Clamp blip inside the radar disc
             dx, dy = bx - cx, by - cy
             dist   = math.sqrt(dx * dx + dy * dy)
             if dist > radar_r * 0.90:
@@ -1096,48 +886,40 @@ class OverlayWindow(QtWidgets.QWidget):
             blip_r = 4.0 + 4.0 * pulse.intensity * age_factor
 
             if pulse.depth < -0.15:
-                blip_col = QtGui.QColor(255, 80, 0, alpha)    # orange = behind
+                blip_col = QtGui.QColor(255, 80, 0, alpha)
             elif pulse.is_footstep and settings["show_footstep_lock"]:
-                blip_col = QtGui.QColor(57, 255, 20, alpha)   # green = footstep
+                blip_col = QtGui.QColor(57, 255, 20, alpha)
             else:
-                blip_col = QtGui.QColor(0, 255, 100, alpha)   # bright green = normal
+                blip_col = QtGui.QColor(0, 255, 100, alpha)
 
             painter.setBrush(QtGui.QBrush(blip_col))
             painter.setPen(QtCore.Qt.NoPen)
-            painter.drawEllipse(QtCore.QPointF(bx, by), blip_r, blip_r)
+            self.cached_point.setX(bx)
+            self.cached_point.setY(by)
+            painter.drawEllipse(self.cached_point, blip_r, blip_r)
 
-            # Glow halo
-            halo_col = QtGui.QColor(blip_col)
-            halo_col.setAlpha(int(alpha * 0.35))
-            painter.setBrush(QtGui.QBrush(halo_col))
-            painter.drawEllipse(QtCore.QPointF(bx, by), blip_r * 2.5, blip_r * 2.5)
+            blip_col.setAlpha(int(alpha * 0.35))
+            painter.setBrush(QtGui.QBrush(blip_col))
+            painter.drawEllipse(self.cached_point, blip_r * 2.5, blip_r * 2.5)
 
-        # ── Label ──────────────────────────────────────────────────────────
         label_font = painter.font()
         label_font.setPointSize(7)
         label_font.setBold(True)
         painter.setFont(label_font)
         painter.setPen(QtGui.QColor(0, 200, 80, 160))
-        painter.drawText(
-            QtCore.QRectF(cx - radar_r, cy + radar_r + 4, radar_r * 2, 14),
-            QtCore.Qt.AlignCenter, "SPATIAL RADAR"
-        )
+        self.cached_rect.setRect(cx - radar_r, cy + radar_r + 4, radar_r * 2, 14)
+        painter.drawText(self.cached_rect, QtCore.Qt.AlignCenter, "SPATIAL RADAR")
 
-        # Cardinal direction labels (N/E/S/W)
         label_pen = QtGui.QPen(QtGui.QColor(0, 160, 60, 120))
         painter.setPen(label_pen)
         offset = radar_r - 12
-        for text, lx, ly in [
-            ("N", cx - 5,       cy - offset - 2),
-            ("S", cx - 5,       cy + offset - 12),
-            ("W", cx - offset - 2, cy - 6),
-            ("E", cx + offset - 10, cy - 6),
-        ]:
-            painter.drawText(int(lx), int(ly), 12, 12, QtCore.Qt.AlignCenter, text)
+        painter.drawText(cx - 5,        cy - offset - 2, 12, 12, QtCore.Qt.AlignCenter, "N")
+        painter.drawText(cx - 5,        cy + offset - 12, 12, 12, QtCore.Qt.AlignCenter, "S")
+        painter.drawText(cx - offset - 2, cy - 6,          12, 12, QtCore.Qt.AlignCenter, "W")
+        painter.drawText(cx + offset - 10, cy - 6,          12, 12, QtCore.Qt.AlignCenter, "E")
 
 
 def run_app():
-    # High-DPI screen scaling
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps,    True)
 
