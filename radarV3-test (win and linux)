@@ -34,7 +34,11 @@ class Config:
             "show_footstep_lock": True,          # Show specialized extra green target dot for footsteps
             "adaptive_gain": True,               # Dynamically adjust volume levels
             "use_arrows": True,                  # Replace panned dots with arrows
-            "responsiveness": 0.60               # Controls smoothing / tracking speed
+            "responsiveness": 0.60,              # Controls smoothing / tracking speed
+            "display_mode": "hud",               # "hud" = bar overlay, "radar" = circular radar
+            "radar_x_pos": 0.85,                 # Radar circle center X (0.0–1.0)
+            "radar_y_pos": 0.85,                 # Radar circle center Y (0.0–1.0)
+            "radar_size": 140                    # Radar circle radius in pixels
         }
         self.settings = self.load()
 
@@ -58,6 +62,59 @@ class Config:
                 json.dump(self.settings, f, indent=4)
         except Exception as e:
             print(f"[SYSTEM] Error saving configuration: {e}")
+
+# ─── Built-in presets ──────────────────────────────────────────────────────────
+PRESETS = {
+    "FPS Competitive": {
+        "sensitivity": 7.0,
+        "noise_gate": 0.025,
+        "panning_sensitivity": 4.5,
+        "hud_width_ratio": 0.90,
+        "overlay_y_pos": 0.35,
+        "show_footstep_lock": True,
+        "adaptive_gain": True,
+        "use_arrows": True,
+        "responsiveness": 0.75,
+        "display_mode": "hud",
+    },
+    "FPS Casual": {
+        "sensitivity": 4.5,
+        "noise_gate": 0.018,
+        "panning_sensitivity": 3.0,
+        "hud_width_ratio": 0.95,
+        "overlay_y_pos": 0.40,
+        "show_footstep_lock": True,
+        "adaptive_gain": True,
+        "use_arrows": True,
+        "responsiveness": 0.60,
+        "display_mode": "hud",
+    },
+    "Radar Mode": {
+        "sensitivity": 5.0,
+        "noise_gate": 0.015,
+        "panning_sensitivity": 3.5,
+        "hud_width_ratio": 0.95,
+        "overlay_y_pos": 0.40,
+        "show_footstep_lock": True,
+        "adaptive_gain": True,
+        "use_arrows": False,
+        "responsiveness": 0.55,
+        "display_mode": "radar",
+    },
+    "Ultra Sensitive": {
+        "sensitivity": 15.0,
+        "noise_gate": 0.008,
+        "panning_sensitivity": 5.0,
+        "hud_width_ratio": 0.98,
+        "overlay_y_pos": 0.38,
+        "show_footstep_lock": True,
+        "adaptive_gain": False,
+        "use_arrows": True,
+        "responsiveness": 0.85,
+        "display_mode": "hud",
+    },
+}
+
 
 class SoundPulse:
     """Represents a spatialized audio vector containing panning, intensity, depth, and footstep flags."""
@@ -312,7 +369,7 @@ class SettingsWindow(QtWidgets.QMainWindow):
         self.audio_processor.on_device_auto_changed_callback = self.handle_auto_device_switch
 
         self.setWindowTitle("Tactical Spatial Radar")
-        self.resize(460, 640)
+        self.resize(480, 820)
         self.setStyleSheet(self.get_stylesheet())
         self.init_ui()
 
@@ -398,6 +455,40 @@ class SettingsWindow(QtWidgets.QMainWindow):
                 background-color: #39ff14;
                 color: #050508;
             }
+            QPushButton#resetBtn {
+                border-color: #ff6b35;
+                color: #ff6b35;
+            }
+            QPushButton#resetBtn:hover {
+                background-color: #ff6b35;
+                color: #050508;
+            }
+            QPushButton#presetBtn {
+                border-color: #a855f7;
+                color: #a855f7;
+                padding: 7px;
+                font-size: 10px;
+            }
+            QPushButton#presetBtn:hover {
+                background-color: #a855f7;
+                color: #050508;
+            }
+            QRadioButton {
+                spacing: 8px;
+                font-size: 11px;
+                color: #e2e8f0;
+            }
+            QRadioButton::indicator {
+                width: 14px;
+                height: 14px;
+                border: 1px solid #141b2d;
+                border-radius: 7px;
+                background: #090d16;
+            }
+            QRadioButton::indicator:checked {
+                background: #00f0ff;
+                border: 1px solid #38bdf8;
+            }
             QCheckBox {
                 spacing: 8px;
                 font-size: 11px;
@@ -466,6 +557,7 @@ class SettingsWindow(QtWidgets.QMainWindow):
         ctrl_layout.setSpacing(10)
 
         self.row_counter = 0
+        self.slider_refs = {}  # key → (slider, val_lbl, factor, decimals)
 
         def add_config_slider(label, key, min_val, max_val, factor, decimals):
             lbl    = QtWidgets.QLabel(label)
@@ -487,6 +579,7 @@ class SettingsWindow(QtWidgets.QMainWindow):
             ctrl_layout.addWidget(lbl,     self.row_counter, 0)
             ctrl_layout.addWidget(slider,  self.row_counter, 1)
             ctrl_layout.addWidget(val_lbl, self.row_counter, 2)
+            self.slider_refs[key] = (slider, val_lbl, factor, decimals)
             self.row_counter += 1
 
         add_config_slider("1. Master Volume Sensitivity:", "sensitivity",       1.0,   25.0, 10.0,   1)
@@ -520,11 +613,52 @@ class SettingsWindow(QtWidgets.QMainWindow):
 
         layout.addWidget(feature_group)
 
+        # ── Display Mode ──────────────────────────────────────────────────────
+        mode_group  = QtWidgets.QGroupBox("Display Mode")
+        mode_layout = QtWidgets.QHBoxLayout(mode_group)
+
+        self.mode_hud_rb = QtWidgets.QRadioButton("◈  HUD Bar  (classic horizontal overlay)")
+        self.mode_radar_rb = QtWidgets.QRadioButton("◉  Radar Circle  (rotating sweep radar)")
+
+        current_mode = self.config.settings.get("display_mode", "hud")
+        self.mode_hud_rb.setChecked(current_mode == "hud")
+        self.mode_radar_rb.setChecked(current_mode == "radar")
+
+        self.mode_hud_rb.toggled.connect(lambda checked: self.on_display_mode_changed("hud") if checked else None)
+        self.mode_radar_rb.toggled.connect(lambda checked: self.on_display_mode_changed("radar") if checked else None)
+
+        mode_layout.addWidget(self.mode_hud_rb)
+        mode_layout.addWidget(self.mode_radar_rb)
+        layout.addWidget(mode_group)
+
+        # ── Presets ───────────────────────────────────────────────────────────
+        preset_group  = QtWidgets.QGroupBox("Quick Presets")
+        preset_layout = QtWidgets.QGridLayout(preset_group)
+        preset_layout.setSpacing(8)
+
+        preset_names = list(PRESETS.keys())
+        for i, name in enumerate(preset_names):
+            btn = QtWidgets.QPushButton(name)
+            btn.setObjectName("presetBtn")
+            btn.setToolTip(f"Load the '{name}' preset")
+            btn.clicked.connect(lambda checked, n=name: self.apply_preset(n))
+            preset_layout.addWidget(btn, i // 2, i % 2)
+
+        layout.addWidget(preset_group)
+
         # ── Action row ────────────────────────────────────────────────────────
         action_layout = QtWidgets.QHBoxLayout()
-        color_btn = QtWidgets.QPushButton("Choose HUD Theme Color")
+
+        color_btn = QtWidgets.QPushButton("🎨  HUD Theme Color")
         color_btn.clicked.connect(self.choose_color)
         action_layout.addWidget(color_btn)
+
+        reset_btn = QtWidgets.QPushButton("↺  Reset to Defaults")
+        reset_btn.setObjectName("resetBtn")
+        reset_btn.setToolTip("Restore all settings to factory defaults")
+        reset_btn.clicked.connect(self.reset_to_defaults)
+        action_layout.addWidget(reset_btn)
+
         layout.addLayout(action_layout)
 
         # ── Status label ──────────────────────────────────────────────────────
@@ -624,6 +758,54 @@ class SettingsWindow(QtWidgets.QMainWindow):
             self.config.settings["dot_color"] = color.name()
             self.config.save()
 
+    def on_display_mode_changed(self, mode):
+        self.config.settings["display_mode"] = mode
+        self.config.save()
+
+    def apply_preset(self, name):
+        preset = PRESETS.get(name, {})
+        for k, v in preset.items():
+            self.config.settings[k] = v
+        self.config.save()
+        self.refresh_all_ui()
+        self.dev_label.setText(f"Preset loaded: {name}")
+
+    def reset_to_defaults(self):
+        for k, v in self.config.defaults.items():
+            self.config.settings[k] = v
+        self.config.save()
+        self.refresh_all_ui()
+        self.dev_label.setText("Settings reset to factory defaults.")
+
+    def refresh_all_ui(self):
+        """Sync all sliders, checkboxes, and radio buttons to current config."""
+        for key, (slider, val_lbl, factor, decimals) in self.slider_refs.items():
+            val = self.config.settings.get(key, 0)
+            slider.blockSignals(True)
+            slider.setValue(int(val * factor))
+            slider.blockSignals(False)
+            val_lbl.setText(f"{val:.{decimals}f}")
+
+        self.footstep_cb.blockSignals(True)
+        self.footstep_cb.setChecked(self.config.settings.get("show_footstep_lock", True))
+        self.footstep_cb.blockSignals(False)
+
+        self.adaptive_cb.blockSignals(True)
+        self.adaptive_cb.setChecked(self.config.settings.get("adaptive_gain", True))
+        self.adaptive_cb.blockSignals(False)
+
+        self.arrows_cb.blockSignals(True)
+        self.arrows_cb.setChecked(self.config.settings.get("use_arrows", True))
+        self.arrows_cb.blockSignals(False)
+
+        mode = self.config.settings.get("display_mode", "hud")
+        self.mode_hud_rb.blockSignals(True)
+        self.mode_radar_rb.blockSignals(True)
+        self.mode_hud_rb.setChecked(mode == "hud")
+        self.mode_radar_rb.setChecked(mode == "radar")
+        self.mode_hud_rb.blockSignals(False)
+        self.mode_radar_rb.blockSignals(False)
+
     def closeEvent(self, event):
         self.audio_processor.stop()
         self.overlay_window.close()
@@ -637,6 +819,7 @@ class OverlayWindow(QtWidgets.QWidget):
         self.audio_processor = audio_processor
         self.config          = config
         self.pulses          = deque()
+        self.radar_sweep_angle = -90.0   # degrees; -90 = pointing up (12 o'clock)
 
         self.init_overlay()
 
@@ -699,11 +882,22 @@ class OverlayWindow(QtWidgets.QWidget):
                 max_age      = max_trail_age
             ))
 
+        # Advance radar sweep (~1.8 RPM  at 120 Hz refresh)
+        self.radar_sweep_angle = (self.radar_sweep_angle + 1.8) % 360.0
+
         self.update()
 
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
+
+        mode = self.config.settings.get("display_mode", "hud")
+        if mode == "radar":
+            self.paint_radar_mode(painter)
+        else:
+            self.paint_hud_mode(painter)
+
+    def paint_hud_mode(self, painter):
 
         settings         = self.config.settings
         width            = self.width()
@@ -808,6 +1002,138 @@ class OverlayWindow(QtWidgets.QWidget):
                 painter.setPen(step_color)
                 rect = QtCore.QRectF(x_pos - 80, y_pos - target_radius - 22, 160, 18)
                 painter.drawText(rect, QtCore.Qt.AlignCenter, "WALKING / STEP")
+
+    def paint_radar_mode(self, painter):
+        """Renders a circular rotating-sweep radar in the corner of the screen."""
+        import math
+
+        settings  = self.config.settings
+        width     = self.width()
+        height    = self.height()
+
+        radar_r   = int(settings.get("radar_size", 140))
+        cx        = int(width  * settings.get("radar_x_pos", 0.85))
+        cy        = int(height * settings.get("radar_y_pos", 0.85))
+
+        # ── Background disc ────────────────────────────────────────────────
+        bg_color = QtGui.QColor(0, 12, 4, 200)
+        painter.setBrush(QtGui.QBrush(bg_color))
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.drawEllipse(QtCore.QPointF(cx, cy), radar_r, radar_r)
+
+        # ── Grid rings ─────────────────────────────────────────────────────
+        ring_pen = QtGui.QPen(QtGui.QColor(0, 180, 60, 55))
+        ring_pen.setWidth(1)
+        painter.setPen(ring_pen)
+        painter.setBrush(QtCore.Qt.NoBrush)
+        for frac in [0.33, 0.66, 1.0]:
+            r = radar_r * frac
+            painter.drawEllipse(QtCore.QPointF(cx, cy), r, r)
+
+        # ── Crosshair lines ────────────────────────────────────────────────
+        cross_pen = QtGui.QPen(QtGui.QColor(0, 180, 60, 40))
+        cross_pen.setWidth(1)
+        painter.setPen(cross_pen)
+        painter.drawLine(int(cx - radar_r), cy, int(cx + radar_r), cy)
+        painter.drawLine(cx, int(cy - radar_r), cx, int(cy + radar_r))
+
+        # ── Outer border ring ──────────────────────────────────────────────
+        border_pen = QtGui.QPen(QtGui.QColor(0, 220, 80, 180))
+        border_pen.setWidth(2)
+        painter.setPen(border_pen)
+        painter.setBrush(QtCore.Qt.NoBrush)
+        painter.drawEllipse(QtCore.QPointF(cx, cy), radar_r, radar_r)
+
+        # ── Sweep cone (fading pie wedge) ──────────────────────────────────
+        sweep_deg  = self.radar_sweep_angle   # current tip angle (0=right, CCW)
+        cone_span  = 60                        # degrees of fading trail
+        grad       = QtGui.QConicalGradient(cx, cy, -sweep_deg)
+        grad.setColorAt(0.0,  QtGui.QColor(0, 255, 80, 130))
+        grad.setColorAt(float(cone_span) / 360.0, QtGui.QColor(0, 255, 80, 0))
+        grad.setColorAt(1.0,  QtGui.QColor(0, 255, 80, 0))
+        painter.setBrush(QtGui.QBrush(grad))
+        painter.setPen(QtCore.Qt.NoPen)
+        # Draw as clipped ellipse fill
+        painter.save()
+        clip_path = QtGui.QPainterPath()
+        clip_path.addEllipse(QtCore.QPointF(cx, cy), radar_r, radar_r)
+        painter.setClipPath(clip_path)
+        rect = QtCore.QRectF(cx - radar_r, cy - radar_r, radar_r * 2, radar_r * 2)
+        start_angle = int((-sweep_deg) * 16)
+        span_angle  = int(-cone_span * 16)
+        painter.drawPie(rect, start_angle, span_angle)
+        painter.restore()
+
+        # ── Sweep tip line ─────────────────────────────────────────────────
+        sweep_rad  = math.radians(sweep_deg)
+        tip_x      = cx + radar_r * math.cos(sweep_rad)
+        tip_y      = cy + radar_r * math.sin(sweep_rad)
+        tip_pen    = QtGui.QPen(QtGui.QColor(0, 255, 80, 220))
+        tip_pen.setWidth(2)
+        painter.setPen(tip_pen)
+        painter.drawLine(cx, cy, int(tip_x), int(tip_y))
+
+        # ── Audio blips ────────────────────────────────────────────────────
+        # Map: direction (-1..1) → angle offset from top (-90..+90°)
+        # depth (+1=front/top, -1=behind/bottom) → Y axis
+        for pulse in self.pulses:
+            age_factor = 1.0 - (pulse.age / pulse.max_age)
+            alpha      = int(200 * age_factor * (0.5 + 0.5 * pulse.intensity))
+            alpha      = max(0, min(255, alpha))
+
+            # Convert direction/depth → polar offset within radar circle
+            bx = cx + (radar_r * 0.82) * pulse.direction
+            by = cy - (radar_r * 0.70) * pulse.depth
+
+            # Clamp blip inside the radar disc
+            dx, dy = bx - cx, by - cy
+            dist   = math.sqrt(dx * dx + dy * dy)
+            if dist > radar_r * 0.90:
+                scale  = (radar_r * 0.90) / dist
+                bx     = cx + dx * scale
+                by     = cy + dy * scale
+
+            blip_r = 4.0 + 4.0 * pulse.intensity * age_factor
+
+            if pulse.depth < -0.15:
+                blip_col = QtGui.QColor(255, 80, 0, alpha)    # orange = behind
+            elif pulse.is_footstep and settings["show_footstep_lock"]:
+                blip_col = QtGui.QColor(57, 255, 20, alpha)   # green = footstep
+            else:
+                blip_col = QtGui.QColor(0, 255, 100, alpha)   # bright green = normal
+
+            painter.setBrush(QtGui.QBrush(blip_col))
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.drawEllipse(QtCore.QPointF(bx, by), blip_r, blip_r)
+
+            # Glow halo
+            halo_col = QtGui.QColor(blip_col)
+            halo_col.setAlpha(int(alpha * 0.35))
+            painter.setBrush(QtGui.QBrush(halo_col))
+            painter.drawEllipse(QtCore.QPointF(bx, by), blip_r * 2.5, blip_r * 2.5)
+
+        # ── Label ──────────────────────────────────────────────────────────
+        label_font = painter.font()
+        label_font.setPointSize(7)
+        label_font.setBold(True)
+        painter.setFont(label_font)
+        painter.setPen(QtGui.QColor(0, 200, 80, 160))
+        painter.drawText(
+            QtCore.QRectF(cx - radar_r, cy + radar_r + 4, radar_r * 2, 14),
+            QtCore.Qt.AlignCenter, "SPATIAL RADAR"
+        )
+
+        # Cardinal direction labels (N/E/S/W)
+        label_pen = QtGui.QPen(QtGui.QColor(0, 160, 60, 120))
+        painter.setPen(label_pen)
+        offset = radar_r - 12
+        for text, lx, ly in [
+            ("N", cx - 5,       cy - offset - 2),
+            ("S", cx - 5,       cy + offset - 12),
+            ("W", cx - offset - 2, cy - 6),
+            ("E", cx + offset - 10, cy - 6),
+        ]:
+            painter.drawText(int(lx), int(ly), 12, 12, QtCore.Qt.AlignCenter, text)
 
 
 def run_app():
